@@ -10,7 +10,7 @@ def main():
     # Change load_button to the real attribute name in your view.
     view.load_button.configure(command=controller.load_files)
     view.save_button.configure(command=controller.save_csv)
-    
+    view.clear_button.configure(command=controller.clear_spectra)
     view.mainloop()
 
 

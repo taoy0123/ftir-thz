@@ -7,12 +7,25 @@ def load_spectrum(filename):
     :return: 2D Numpy array of data
     """
     spectrum = np.loadtxt(filename)
+    frequencies = spectrum[:, 0]  # Assuming the first column is frequency
+    intensities = spectrum[:, 1]  # Assuming the second column is intensity
+    return frequencies, intensities
 
-    return spectrum
-
-def save_spectrum(filename, wavenumber, values):
-    data = np.column_stack((wavenumber, values))
-    np.savetxt(filename, data, delimiter=",", header="wavenumber,values", comments="")
+def save_spectra(filename, spectra):
+    """spectra: list of (label, frequency, delta_A). Each pair gets two columns."""
+    n_rows = max(len(freq) for _, freq, _ in spectra)
+    columns, header = [], []
+    for label, freq, delta_A in spectra:
+        label = label.replace(",", "_")  # commas would break the CSV header
+        for name, values in ((f"frequency [{label}]", freq), (f"delta_A [{label}]", delta_A)):
+            col = np.full(n_rows, np.nan)  # pad shorter spectra with NaN
+            col[: len(values)] = values
+            columns.append(col)
+            header.append(name)
+    np.savetxt(
+        filename, np.column_stack(columns),
+        delimiter=",", header=",".join(header), comments="",
+    )
 
 def calculate_difference_absorbance(sample_intensities, reference_intensities):
     """
