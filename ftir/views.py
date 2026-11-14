@@ -1,5 +1,10 @@
-"""Complete replacement for ftir/views.py: multi-pair loading dialog, plus the
-main window with zoom toolbar, scroll-wheel zoom and a legend for several spectra.
+"""Complete replacement for ftir/views.py.
+
+Adds to the previous version:
+  * Empty cell and Background file fields (with Browse and clear buttons)
+  * a switch beside the graph: difference absorbance <-> absorption coefficient
+  * a label showing the gap thickness
+  * plot_spectra(spectra, ylabel) so the controller chooses the y-axis label
 """
 
 import tkinter as tk
@@ -134,19 +139,21 @@ class LoadPairsDialog(ctk.CTkToplevel):
 
 
 class View(ctk.CTk):
-    """Main application window: buttons, plot area and zoom toolbar."""
+    """Main window: buttons, empty cell/background fields, plot, toggle and toolbar."""
+
+    DEFAULT_YLABEL = "Difference absorbance, \u0394A"
 
     def __init__(self):
         super().__init__()
         self.title("FTIR THz analysis")
-        self.geometry("900x650")
+        self.geometry("1000x720")
 
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)  # plot column stretches
+        self.grid_rowconfigure(2, weight=1)     # plot row stretches
 
-        # Top bar (the controller attaches the commands in main.py)
+        # Row 0: action buttons (the controller attaches their commands)
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=0, column=0, padx=15, pady=15, sticky="w")
+        bar.grid(row=0, column=0, columnspan=2, padx=15, pady=15, sticky="w")
         self.load_button = ctk.CTkButton(bar, text="Load files...")
         self.load_button.pack(side="left", padx=(0, 10))
         self.save_button = ctk.CTkButton(bar, text="Save CSV...")
@@ -154,33 +161,91 @@ class View(ctk.CTk):
         self.clear_button = ctk.CTkButton(bar, text="Clear", fg_color="gray")
         self.clear_button.pack(side="left", padx=(10, 0))
 
-        # Embedded matplotlib figure
+        # Row 1: empty cell and background files
+        cells = ctk.CTkFrame(self)
+        cells.grid(row=1, column=0, columnspan=2, padx=15, pady=(0, 10), sticky="ew")
+        cells.grid_columnconfigure(1, weight=1)
+        self.empty_var = tk.StringVar()
+        self.background_var = tk.StringVar()
+        self.empty_button, self.empty_clear = self._add_file_row(
+            cells, 0, "Empty cell:", self.empty_var
+        )
+        self.background_button, self.background_clear = self._add_file_row(
+            cells, 1, "Background:", self.background_var
+        )
+
+        # Row 2, column 0: embedded matplotlib figure
+        self._ylabel = self.DEFAULT_YLABEL
         self.figure = Figure(figsize=(6, 4), dpi=100)
         self.ax = self.figure.add_subplot(111)
         self._style_axes()
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
-        self.canvas.get_tk_widget().grid(row=1, column=0, padx=15, pady=(0, 5), sticky="nsew")
+        self.canvas.get_tk_widget().grid(row=2, column=0, padx=(15, 5), pady=(0, 5), sticky="nsew")
 
-        # Home / Back / Forward / Pan / Zoom-to-rectangle / Save image
+        # Row 2, column 1: side panel with the display toggle
+        panel = ctk.CTkFrame(self)
+        panel.grid(row=2, column=1, padx=(0, 15), pady=(0, 5), sticky="n")
+        ctk.CTkLabel(panel, text="Display", font=ctk.CTkFont(weight="bold")).pack(
+            padx=15, pady=(15, 5)
+        )
+        self.display_switch = ctk.CTkSwitch(panel, text="Absorption coeff.", state="disabled")
+        self.display_switch.pack(padx=15, pady=5)
+        ctk.CTkLabel(
+            panel, text="Off: \u0394A\nOn: \u03b1 (cm\u207b\u00b9)", justify="left"
+        ).pack(padx=15, pady=(0, 10))
+        self.thickness_label = ctk.CTkLabel(panel, text="Gap thickness: \u2014")
+        self.thickness_label.pack(padx=15, pady=(5, 15))
+
+        # Row 3: zoom/pan toolbar
         self.toolbar = NavigationToolbar2Tk(self.canvas, self, pack_toolbar=False)
-        self.toolbar.grid(row=2, column=0, padx=15, pady=(0, 15), sticky="w")
+        self.toolbar.grid(row=3, column=0, padx=15, pady=(0, 15), sticky="w")
 
         # Mouse-wheel zoom around the cursor
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
 
-    def _style_axes(self):
-        self.ax.set_xlabel("Frequency (THz)")  # change units to match your data
-        self.ax.set_ylabel("Absorbance change, \u0394A")
+    def _add_file_row(self, parent, row, label, variable):
+        """One read-only path field with Browse and clear (X) buttons."""
+        ctk.CTkLabel(parent, text=label).grid(row=row, column=0, padx=(10, 5), pady=5, sticky="w")
+        ctk.CTkEntry(parent, textvariable=variable, state="readonly").grid(
+            row=row, column=1, padx=5, pady=5, sticky="ew"
+        )
+        browse = ctk.CTkButton(parent, text="Browse...", width=90)
+        browse.grid(row=row, column=2, padx=5, pady=5)
+        clear = ctk.CTkButton(parent, text="\u2715", width=32, fg_color="gray")
+        clear.grid(row=row, column=3, padx=(0, 10), pady=5)
+        return browse, clear
 
-    def plot_spectra(self, spectra):
+    def _style_axes(self):
+        self.ax.set_xlabel("Wavenumber (cm\u207b\u00b9)")  # change if your axis differs
+        self.ax.set_ylabel(self._ylabel)
+
+    # ------------------------------------------------------------------
+    # Methods the controller calls
+    # ------------------------------------------------------------------
+    def coefficient_mode(self):
+        """True when the switch is on (show absorption coefficient)."""
+        return bool(self.display_switch.get())
+
+    def set_cell_thickness(self, thickness_um):
+        """Show the gap thickness and enable the switch, or disable it if None."""
+        if thickness_um is None:
+            self.thickness_label.configure(text="Gap thickness: \u2014")
+            self.display_switch.deselect()
+            self.display_switch.configure(state="disabled")
+        else:
+            self.thickness_label.configure(text=f"Gap thickness: {thickness_um:.1f} \u00b5m")
+            self.display_switch.configure(state="normal")
+
+    def plot_spectra(self, spectra, ylabel=DEFAULT_YLABEL):
         """Plot several spectra, each in its own colour.
 
-        spectra: list of (label, frequency, delta_A) tuples. Matplotlib's
+        spectra: list of (label, frequency, values) tuples. Matplotlib's
         default colour cycle assigns a different colour to each line.
         """
+        self._ylabel = ylabel
         self.ax.clear()
-        for label, frequency, delta_A in spectra:
-            self.ax.plot(frequency, delta_A, label=label)
+        for label, frequency, values in spectra:
+            self.ax.plot(frequency, values, label=label)
         self._style_axes()
         if spectra:
             self.ax.legend()
@@ -207,10 +272,14 @@ class View(ctk.CTk):
 
 
 if __name__ == "__main__":
-    # Quick visual test of the window with fake data (run: python -m ftir.views)
+    # Quick visual test with fake data (run: python -m ftir.views).
+    # The switch only does something once the controller is connected.
     import numpy as np
 
     app = View()
-    x = np.linspace(0.2, 3, 200)
-    app.plot_spectra([("Pair 1", x, np.exp(-x)), ("Pair 2", x, 0.5 * np.exp(-x / 2))])
+    x = np.linspace(400, 4000, 400)
+    app.plot_spectra(
+        [("Pair 1", x, np.exp(-x / 2000)), ("Pair 2", x, 0.5 * np.exp(-x / 4000))]
+    )
+    app.set_cell_thickness(50.0)  # comment this out to see the disabled switch
     app.mainloop()
