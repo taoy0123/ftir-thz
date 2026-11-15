@@ -371,7 +371,7 @@ def remove_fringes(
     absorbance,
     period=None,
     period_range=(2.0, 10.0),
-    region=None,
+    region=(30, 100),
     min_prominence=5.0,
 ):
     """Suppress etalon fringes (e.g. from diamond windows) by half-period averaging.
