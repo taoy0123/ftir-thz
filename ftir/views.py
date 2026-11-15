@@ -1,8 +1,10 @@
-"""Complete replacement for ftir/views.py.
-
-Adds to the previous version:
-  * Empty cell and Background file fields (with Browse and clear buttons)
-  * a switch beside the graph: difference absorbance <-> absorption coefficient
+"""
+Main window:
+  * Empty cell, Background and Water vapour file fields (Browse and clear buttons)
+  * three switches beside the graph:
+      - difference absorbance <-> absorption coefficient (needs empty cell + background)
+      - fringes: original <-> etalon fringes removed
+      - water vapour: original <-> water vapour removed (needs a water vapour file)
   * a label showing the gap thickness
   * plot_spectra(spectra, ylabel) so the controller chooses the y-axis label
 """
@@ -139,14 +141,14 @@ class LoadPairsDialog(ctk.CTkToplevel):
 
 
 class View(ctk.CTk):
-    """Main window: buttons, empty cell/background fields, plot, toggle and toolbar."""
+    """Main window: buttons, reference file fields, plot, switches and toolbar."""
 
     DEFAULT_YLABEL = "Difference absorbance, \u0394A"
 
     def __init__(self):
         super().__init__()
         self.title("FTIR THz analysis")
-        self.geometry("1000x720")
+        self.geometry("1050x800")
 
         self.grid_columnconfigure(0, weight=1)  # plot column stretches
         self.grid_rowconfigure(2, weight=1)     # plot row stretches
@@ -161,17 +163,21 @@ class View(ctk.CTk):
         self.clear_button = ctk.CTkButton(bar, text="Clear", fg_color="gray")
         self.clear_button.pack(side="left", padx=(10, 0))
 
-        # Row 1: empty cell and background files
+        # Row 1: empty cell, background and water vapour files
         cells = ctk.CTkFrame(self)
         cells.grid(row=1, column=0, columnspan=2, padx=15, pady=(0, 10), sticky="ew")
         cells.grid_columnconfigure(1, weight=1)
         self.empty_var = tk.StringVar()
         self.background_var = tk.StringVar()
+        self.water_var = tk.StringVar()
         self.empty_button, self.empty_clear = self._add_file_row(
             cells, 0, "Empty cell:", self.empty_var
         )
         self.background_button, self.background_clear = self._add_file_row(
             cells, 1, "Background:", self.background_var
+        )
+        self.water_button, self.water_clear = self._add_file_row(
+            cells, 2, "Water vapour:", self.water_var
         )
 
         # Row 2, column 0: embedded matplotlib figure
@@ -182,19 +188,32 @@ class View(ctk.CTk):
         self.canvas = FigureCanvasTkAgg(self.figure, master=self)
         self.canvas.get_tk_widget().grid(row=2, column=0, padx=(15, 5), pady=(0, 5), sticky="nsew")
 
-        # Row 2, column 1: side panel with the display toggle
+        # Row 2, column 1: side panel with the switches
         panel = ctk.CTkFrame(self)
         panel.grid(row=2, column=1, padx=(0, 15), pady=(0, 5), sticky="n")
-        ctk.CTkLabel(panel, text="Display", font=ctk.CTkFont(weight="bold")).pack(
-            padx=15, pady=(15, 5)
-        )
+        bold = ctk.CTkFont(weight="bold")
+
+        ctk.CTkLabel(panel, text="Display", font=bold).pack(padx=15, pady=(15, 5))
         self.display_switch = ctk.CTkSwitch(panel, text="Absorption coeff.", state="disabled")
-        self.display_switch.pack(padx=15, pady=5)
+        self.display_switch.pack(padx=15, pady=5, anchor="w")
         ctk.CTkLabel(
             panel, text="Off: \u0394A\nOn: \u03b1 (cm\u207b\u00b9)", justify="left"
-        ).pack(padx=15, pady=(0, 10))
+        ).pack(padx=15, pady=(0, 5), anchor="w")
         self.thickness_label = ctk.CTkLabel(panel, text="Gap thickness: \u2014")
-        self.thickness_label.pack(padx=15, pady=(5, 15))
+        self.thickness_label.pack(padx=15, pady=(0, 10), anchor="w")
+
+        ctk.CTkLabel(panel, text="Corrections", font=bold).pack(padx=15, pady=(10, 5))
+        self.water_switch = ctk.CTkSwitch(panel, text="Water vapour removed", state="disabled")
+        self.water_switch.pack(padx=15, pady=5, anchor="w")
+        ctk.CTkLabel(
+            panel, text="Needs a water vapour file", justify="left", text_color="gray"
+        ).pack(padx=15, pady=(0, 5), anchor="w")
+        self.fringe_switch = ctk.CTkSwitch(panel, text="Fringes removed")
+        self.fringe_switch.pack(padx=15, pady=5, anchor="w")
+        ctk.CTkLabel(
+            panel, text="Diamond window etalon\n(half-period average)",
+            justify="left", text_color="gray",
+        ).pack(padx=15, pady=(0, 15), anchor="w")
 
         # Row 3: zoom/pan toolbar
         self.toolbar = NavigationToolbar2Tk(self.canvas, self, pack_toolbar=False)
@@ -236,12 +255,43 @@ class View(ctk.CTk):
             self.thickness_label.configure(text=f"Gap thickness: {thickness_um:.1f} \u00b5m")
             self.display_switch.configure(state="normal")
 
-    def plot_spectra(self, spectra, ylabel=DEFAULT_YLABEL):
+    def water_mode(self):
+        """True when the water vapour switch is on (show water vapour removed)."""
+        return bool(self.water_switch.get())
+
+    def fringe_mode(self):
+        """True when the fringe switch is on (show fringes removed)."""
+        return bool(self.fringe_switch.get())
+
+    def set_water_available(self, available):
+        """Enable the water vapour switch once a valid file is loaded, else disable it."""
+        if available:
+            self.water_switch.configure(state="normal")
+        else:
+            self.water_switch.deselect()
+            self.water_switch.configure(state="disabled")
+
+    def reset_switch(self, name):
+        """Switch a correction back off (used when a correction fails)."""
+        {"water": self.water_switch, "fringes": self.fringe_switch}[name].deselect()
+
+    def plot_spectra(self, spectra, ylabel=DEFAULT_YLABEL, keep_view=False):
         """Plot several spectra, each in its own colour.
 
         spectra: list of (label, frequency, values) tuples. Matplotlib's
         default colour cycle assigns a different colour to each line.
+
+        keep_view: keep the current zoom (used when a switch is flipped).
+        The x range is always kept; the y range is kept only if the y label
+        (units) is unchanged, because absorbance and absorption coefficient
+        have very different scales.
         """
+        keep_x = keep_y = None
+        if keep_view and spectra and self.ax.lines:
+            keep_x = self.ax.get_xlim()
+            if ylabel == self._ylabel:
+                keep_y = self.ax.get_ylim()
+
         self._ylabel = ylabel
         self.ax.clear()
         for label, frequency, values in spectra:
@@ -251,7 +301,14 @@ class View(ctk.CTk):
             self.ax.legend()
         self.figure.tight_layout()
         self.canvas.draw()
-        self.toolbar.update()  # makes Home return to this new full view
+        self.toolbar.update()  # makes Home return to the full (unzoomed) view
+
+        # Restore the zoom AFTER toolbar.update(), so Home still goes to the full view
+        if keep_x is not None:
+            self.ax.set_xlim(keep_x)
+            if keep_y is not None:
+                self.ax.set_ylim(keep_y)
+            self.canvas.draw_idle()
 
     def _on_scroll(self, event):
         """Scroll up = zoom in, scroll down = zoom out, centred on the cursor."""
