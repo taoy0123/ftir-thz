@@ -371,7 +371,7 @@ def remove_fringes(
     absorbance,
     period=None,
     period_range=(2.0, 10.0),
-    region=(30, 100),
+    region=(120, 200),
     min_prominence=5.0,
 ):
     """Suppress etalon fringes (e.g. from diamond windows) by half-period averaging.
@@ -591,3 +591,155 @@ def save_spectra(filename, spectra, y_name="delta_A"):
         comments="",
     )
  
+def svd_spectra(spectra, wavenumber_range=None, n_components=4, center=False):
+    """Singular value decomposition of a set of spectra.
+
+    Parameters
+    ----------
+    spectra : list of (label, wavenumbers, values)
+        The spectra to decompose (two or more). They may have different axes:
+        they are first put on a shared axis covering the range they all share.
+    wavenumber_range : (low, high), optional
+        Only use this wavenumber range. Either end may be None. Default: all.
+    n_components : int
+        How many components to return (at most this many, fewer if the data
+        has fewer). Default 4.
+    center : bool
+        Subtract the mean spectrum first. Default False (plain SVD of the
+        spectra, as in your SVD script).
+
+    Returns a dict:
+        wavenumber  (m,)    shared wavenumber axis actually used
+        components  (k, m)  principal component spectra (singular value x right
+                            singular vector, the "basis spectra" in your script)
+        scores      (n, k)  score of every spectrum on each component (left
+                            singular vectors, the "populations" in your script)
+        explained   (r,)    percentage of the total variation explained by
+                            EVERY component (r = all of them; sums to 100)
+        singular_values (r,)
+        labels      list of the n spectrum labels
+        centered    bool
+
+    "Explained variation" is s_i^2 / sum(s^2), the standard definition. Your
+    script used s_i / sum(s), which understates the first component.
+
+    Points where any spectrum is NaN are left out. Raises ValueError if there
+    are fewer than two spectra or too little usable data.
+    """
+    if len(spectra) < 2:
+        raise ValueError("SVD needs at least two spectra.")
+    shared = resample_to_common_axis(spectra)
+    axis = shared[0][1]
+    labels = [label for label, _, _ in shared]
+    matrix = np.vstack([values for _, _, values in shared])  # one row per spectrum
+
+    keep = np.ones(axis.size, dtype=bool)
+    if wavenumber_range is not None:
+        low, high = wavenumber_range
+        if low is not None:
+            keep &= axis >= low
+        if high is not None:
+            keep &= axis <= high
+    keep &= np.all(np.isfinite(matrix), axis=0)
+    if keep.sum() < len(shared):
+        raise ValueError(
+            f"Only {int(keep.sum())} usable wavenumber points for {len(shared)} spectra; "
+            "widen the range."
+        )
+    axis, matrix = axis[keep], matrix[:, keep]
+
+    if center:
+        matrix = matrix - matrix.mean(axis=0)
+
+    u, s, vh = np.linalg.svd(matrix, full_matrices=False)
+    total = float(np.sum(s**2))
+    if total == 0.0:
+        raise ValueError("The spectra contain no variation to decompose.")
+    k = int(min(n_components, s.size))
+    return {
+        "wavenumber": axis,
+        "components": s[:k, None] * vh[:k],
+        "scores": u[:, :k],
+        "explained": 100.0 * s**2 / total,
+        "singular_values": s,
+        "labels": labels,
+        "centered": bool(center),
+    }
+
+
+def save_svd(path, result):
+    """Save SVD results as three CSV files next to `path`.
+
+    path = ".../name.csv" writes
+        name_components.csv   wavenumber, PC1, PC2, ...
+        name_scores.csv       spectrum, PC1, PC2, ...
+        name_variance.csv     component, singular_value, explained_percent
+    Returns the three file names.
+    """
+    from pathlib import Path
+
+    base = Path(path)
+    stem = base.with_suffix("")
+    names = [f"PC{i + 1}" for i in range(result["components"].shape[0])]
+
+    components = np.column_stack([result["wavenumber"], result["components"].T])
+    scores_path, comp_path, var_path = (
+        Path(f"{stem}_scores.csv"), Path(f"{stem}_components.csv"), Path(f"{stem}_variance.csv"),
+    )
+    np.savetxt(comp_path, components, delimiter=",", fmt="%.10g",
+               header=",".join(["wavenumber"] + names), comments="")
+
+    with open(scores_path, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(["spectrum"] + names) + "\n")
+        for label, row in zip(result["labels"], result["scores"]):
+            safe = '"' + str(label).replace('"', '""') + '"'
+            f.write(",".join([safe] + [f"{v:.10g}" for v in row]) + "\n")
+
+    with open(var_path, "w", encoding="utf-8", newline="") as f:
+        f.write("component,singular_value,explained_percent\n")
+        for i, (sv, pct) in enumerate(zip(result["singular_values"], result["explained"]), 1):
+            f.write(f"PC{i},{sv:.10g},{pct:.10g}\n")
+    return str(comp_path), str(scores_path), str(var_path)
+
+def distinguishing_labels(labels, keep_prefix=False):
+    """Shorten spectrum labels to the parts that differ between them.
+
+    Labels look like "Pair 3: 05_HCl2_5M_THz_RT_MM8" (optionally followed by a
+    note in square brackets added by the software, such as
+    "[fringes not removed]", which is dropped too). The "Pair N:" prefix is
+    dropped, the file name is split at underscores and spaces, and every piece
+    that appears in ALL the file names is removed:
+        "05_HCl2_5M_THz_RT_MM8", "06_HCl3M_THz_RT_MM8"  ->  "05_HCl2_5M", "06_HCl3M"
+    If that would leave an empty or repeated label, the full file name is used
+    instead, and if those repeat too, the original labels. Always returns a
+    list of the same length.
+
+    keep_prefix=True keeps each label's own "Pair N:" in front of the shortened
+    name ("Pair 2: 06_HCl3M"), as used for the legend of the main plot.
+    """
+    import re
+
+    # Drop notes the software appends, e.g. "[fringes not removed]"
+    labels = [re.sub(r"\s+\[[^\]]*\]\s*$", "", str(label)) for label in labels]
+    prefixes = []
+    for label in labels:
+        match = re.match(r"^(Pair\s+\d+:)\s*", label)
+        prefixes.append(match.group(1) if match else "")
+    names = [re.sub(r"^Pair\s+\d+:\s*", "", label) for label in labels]
+
+    def finish(chosen):
+        if not keep_prefix:
+            return chosen
+        return [f"{prefix} {name}".strip() for prefix, name in zip(prefixes, chosen)]
+
+    if len(labels) < 2:
+        return finish(names)
+
+    pieces = [[p for p in re.split(r"[_\s,]+", name) if p] for name in names]
+    common = set(pieces[0]).intersection(*map(set, pieces[1:]))
+    reduced = ["_".join(p for p in parts if p not in common) for parts in pieces]
+
+    for candidate in (reduced, names):
+        if all(candidate) and len(set(candidate)) == len(candidate):
+            return finish(candidate)
+    return labels if keep_prefix else labels

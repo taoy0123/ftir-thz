@@ -1,17 +1,21 @@
-"""
+"""Complete replacement for ftir/controller.py.
+
 The controller connects the view's controls to the models:
   * sample/reference pairs are aligned to their common wavenumber range
   * empty cell + background give the gap thickness (enables the absorption
     coefficient switch)
   * a water vapour reference file enables the water vapour switch
   * the fringe switch needs no extra file
+  * the SVD button decomposes the displayed spectra
   * corrections are applied in this order: water vapour, fringes, then the
     conversion to absorption coefficient
   * Save CSV asks what to do when the displayed spectra use different
     wavenumber axes
 
-It uses your own models functions: load_spectrum, calculate_difference_absorbance,
-remove_water_vapor and remove_fringes_halfperiod (through the correct_* wrappers).
+It uses these functions from models.py: load_spectrum, calculate_difference_absorbance,
+align_spectra, empty_cell_thickness, absorption_coefficient, correct_water_vapor,
+remove_fringes, group_by_axis, resample_to_common_axis, save_spectra, svd_spectra
+and save_svd.
 """
 
 from pathlib import Path
@@ -20,7 +24,7 @@ from tkinter import filedialog, messagebox
 import numpy as np
 
 from ftir import models
-from ftir.views import FILETYPES, LoadPairsDialog
+from ftir.views import FILETYPES, LoadPairsDialog, SVDDialog
 
 
 class ProcessingError(Exception):
@@ -34,14 +38,18 @@ class ProcessingError(Exception):
 class Controller:
     def __init__(self, view):
         self.view = view
-        self.spectra = []              # one dict per pair: label, frequency, delta_A
+        self.spectra = []              # one dict per pair: label, frequency, delta_A, file paths
         self.cell_thickness_um = None  # set when empty cell and background are both valid
+        self._svd_dialog = None
+        self.fringe_skipped = []       # spectra the fringe correction had to skip
+        self._skip_warned = set()      # ... that the user has already been told about
         self.water = None              # (wavenumbers, values) of the water vapour reference
 
         # Connect every control in the view to its action
         view.load_button.configure(command=self.load_files)
         view.save_button.configure(command=self.save_csv)
         view.clear_button.configure(command=self.clear_spectra)
+        view.svd_button.configure(command=self.show_svd)
         view.empty_button.configure(command=self.choose_empty_cell)
         view.empty_clear.configure(command=self.clear_empty_cell)
         view.background_button.configure(command=self.choose_background)
@@ -56,32 +64,45 @@ class Controller:
     # Sample/reference pairs
     # ------------------------------------------------------------------
     def load_files(self):
-        """Ask for one or more pairs and ADD them to what is already shown."""
-        dialog = LoadPairsDialog(self.view)
+        """Add new pairs and/or remove loaded ones, using one dialog.
+
+        The dialog lists the pairs already loaded; the ones the user leaves in
+        stay as they are, and any new pairs are added after them.
+        """
+        existing = [(s["label"], s["sample_file"], s["reference_file"]) for s in self.spectra]
+        dialog = LoadPairsDialog(self.view, existing)
         self.view.wait_window(dialog)
 
         if dialog.result is None:  # user cancelled
             return
 
-        first_number = len(self.spectra) + 1  # keeps labels unique: Pair 3, Pair 4, ...
+        kept = [self.spectra[i] for i in dialog.kept]
         new_spectra = []
         try:
-            for number, (sample_file, reference_file) in enumerate(
-                dialog.result, start=first_number
-            ):
+            for offset, (sample_file, reference_file) in enumerate(dialog.result):
+                number = len(kept) + offset + 1  # new pairs follow the largest number
                 new_spectra.append(self._process_pair(number, sample_file, reference_file))
         except (OSError, ValueError) as err:
-            # If any new pair fails, none are added and the plot is unchanged
+            # If any new pair fails, nothing changes (removals included)
             messagebox.showerror("Could not load files", str(err), parent=self.view)
             return
 
-        self.spectra.extend(new_spectra)
+        # Pairs are numbered by position: after a removal the later ones move up
+        renamed = {}
+        for number, s in enumerate(kept, start=1):
+            new_label = f"Pair {number}: {Path(s['sample_file']).stem}"
+            renamed[s["label"]] = new_label
+            s["label"] = new_label
+        self._skip_warned = {renamed[l] for l in self._skip_warned if l in renamed}
+
+        self.spectra = kept + new_spectra
         self._warn_about_bad_points(new_spectra)
         self._redraw()
 
     def clear_spectra(self):
         """Remove all pairs from the plot (the reference files stay set)."""
         self.spectra = []
+        self._skip_warned.clear()
         self._redraw()
 
     # ------------------------------------------------------------------
@@ -163,6 +184,48 @@ class Controller:
         """Called when any of the switches is flipped. Keeps the current zoom."""
         self._redraw(keep_view=True)
 
+    # ------------------------------------------------------------------
+    # Singular value decomposition
+    # ------------------------------------------------------------------
+    def show_svd(self):
+        """Open the SVD window for the spectra currently displayed."""
+        if len(self.spectra) < 2:
+            messagebox.showinfo("SVD", "Load at least two spectra first.", parent=self.view)
+            return
+        if self._svd_dialog is not None and self._svd_dialog.winfo_exists():
+            self._svd_dialog.lift()
+            self._svd_dialog.run()  # refresh with whatever is displayed now
+            return
+        self._svd_dialog = SVDDialog(self.view, self._run_svd, self._save_svd)
+
+    def _run_svd(self, low, high, center):
+        """Called by the SVD window. Uses the spectra exactly as displayed."""
+        spectra, _, y_name = self._displayed_safe()
+        result = models.svd_spectra(spectra, (low, high), n_components=4, center=center)
+        result["source"] = f"{len(spectra)} spectra, {y_name}"
+        return result
+
+    def _save_svd(self, result):
+        path = filedialog.asksaveasfilename(
+            parent=self._svd_dialog or self.view,
+            title="Save SVD results (three files are written)",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="svd.csv",
+        )
+        if not path:
+            return
+        try:
+            files = models.save_svd(path, result)
+        except OSError as err:
+            messagebox.showerror("Could not save file", str(err), parent=self._svd_dialog)
+            return
+        messagebox.showinfo(
+            "SVD saved",
+            "Saved:\n" + "\n".join(Path(f).name for f in files),
+            parent=self._svd_dialog,
+        )
+
     def save_csv(self):
         """Save all displayed spectra (as currently shown) to one CSV file."""
         if not self.spectra:
@@ -216,6 +279,7 @@ class Controller:
         use_water = self.view.water_mode() and self.water is not None
         use_fringes = self.view.fringe_mode()
 
+        self.fringe_skipped = []  # (label, reason) of spectra without clear fringes
         spectra = []
         for s in self.spectra:
             frequency, values = s["frequency"], s["delta_A"]
@@ -226,15 +290,24 @@ class Controller:
                 except ValueError as err:
                     raise ProcessingError("water", f"{s['label']}: {err}") from err
 
+            label = s["label"]
             if use_fringes:
                 try:
                     values, _ = models.remove_fringes(frequency, values)
                 except ValueError as err:
-                    raise ProcessingError("fringes", f"{s['label']}: {err}") from err
+                    # No clear fringes in this one: show it uncorrected, carry on
+                    self.fringe_skipped.append((label, str(err)))
+                    label += " [fringes not removed]"
 
             if use_coefficient:
                 values = models.absorption_coefficient(values, self.cell_thickness_um)
-            spectra.append((s["label"], frequency, values))
+            spectra.append((label, frequency, values))
+
+        if use_fringes and self.spectra and len(self.fringe_skipped) == len(self.spectra):
+            first = self.fringe_skipped[0]
+            raise ProcessingError(
+                "fringes", f"No spectrum has clear fringes.\n{first[0]}: {first[1]}"
+            )
 
         # CSV column names say which corrections were applied
         y_name = "alpha_per_cm" if use_coefficient else "delta_A"
@@ -262,9 +335,26 @@ class Controller:
                 )
                 self.view.reset_switch(err.which)
 
+    def _warn_about_skipped_fringes(self):
+        """Tell the user once about spectra left uncorrected (not on every redraw)."""
+        if not self.view.fringe_mode():
+            self._skip_warned.clear()
+        new = [(l, r) for l, r in self.fringe_skipped if l not in self._skip_warned]
+        if not new:
+            return
+        self._skip_warned.update(l for l, _ in new)
+        messagebox.showwarning(
+            "Fringes not removed",
+            "No clear fringes were found in these spectra, so they are shown "
+            "uncorrected (the others were corrected):\n\n"
+            + "\n".join(f"{label}: {reason}" for label, reason in new),
+            parent=self.view,
+        )
+
     def _redraw(self, keep_view=False):
         spectra, ylabel, _ = self._displayed_safe()
         self.view.plot_spectra(spectra, ylabel, keep_view=keep_view)
+        self._warn_about_skipped_fringes()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -306,6 +396,8 @@ class Controller:
             "label": f"Pair {number}: {Path(sample_file).stem}",
             "frequency": frequency,
             "delta_A": delta_A,
+            "sample_file": sample_file,
+            "reference_file": reference_file,
         }
 
     def _warn_about_bad_points(self, spectra):
