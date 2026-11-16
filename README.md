@@ -6,6 +6,7 @@ This program provides an user interface for calculating and displaying FTIR spec
 - Calculates the empty cell thickness for a given empty cell and a background
 - Minimises water vapour absorption lines by subtracting a scaled water vapur spectrum contained in **WaterVapor.txt**
 - Minimises fringes caused by etalons within the transmission windows by the half period averaging method
+- Performs principal component analysis by decomposing the spectra using singular value decomposition
 
 Please refer to _requirements.txt_ for required packages.
 
