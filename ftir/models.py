@@ -366,12 +366,41 @@ def _fringe_period(grid, values, step, period_range, region, min_prominence, tol
     return period
 
 
+def _fringe_period_in_regions(grid, values, step, period_range, region, min_prominence):
+    """Measure the fringe period in the first region that shows clear fringes.
+
+    `region` is None (whole spectrum), one (low, high) pair, or a sequence of
+    pairs tried in order: the next one is used only if the previous gives no
+    clear, consistent fringes (for example because water vapour lines swamp
+    them there). Returns (period, region_used). Raises ValueError listing why
+    every region failed.
+    """
+    if region is None:
+        candidates = [None]
+    elif len(region) == 2 and np.ndim(region[0]) == 0:
+        candidates = [tuple(region)]
+    else:
+        candidates = [tuple(r) for r in region]
+
+    problems = []
+    for candidate in candidates:
+        try:
+            period = _fringe_period(grid, values, step, period_range, candidate, min_prominence)
+            return period, candidate
+        except ValueError as err:
+            name = "whole spectrum" if candidate is None else f"{candidate[0]:g}-{candidate[1]:g} cm\u207b\u00b9"
+            problems.append(f"{name}: {err}")
+    if len(problems) == 1:
+        raise ValueError(problems[0].split(": ", 1)[1])
+    raise ValueError("No clear fringes in any region.\n" + "\n".join(problems))
+
+
 def remove_fringes(
     wavenumbers,
     absorbance,
     period=None,
     period_range=(2.0, 10.0),
-    region=(120, 200),
+    region=((30.0, 100.0), (140, 200)),
     min_prominence=5.0,
 ):
     """Suppress etalon fringes (e.g. from diamond windows) by half-period averaging.
@@ -395,10 +424,13 @@ def remove_fringes(
     period_range : (shortest, longest), optional
         Periods (cm^-1) considered when measuring. The shortest is limited to
         two points of the spectrum.
-    region : (low, high), optional
-        Only measure the period in this wavenumber range (the correction is
-        still applied to the whole spectrum). Use it if something else in the
-        spectrum ripples at similar spacing, for example water vapour lines.
+    region : (low, high), a sequence of such pairs, or None
+        Where to measure the period (the correction is still applied to the
+        whole spectrum). With several regions they are tried in order and the
+        first one with clear, consistent fringes is used, so the later ones are
+        back-ups for when water vapour lines (or anything else that ripples)
+        hide the fringes in the first. None uses the whole spectrum.
+        Default: 30-100 cm^-1, then 200-300 cm^-1.
     min_prominence : float
         How many times higher than the typical ripple the fringe peak must be
         for the fringes to count as clear. Lower it only if you trust weak fringes.
@@ -431,7 +463,9 @@ def remove_fringes(
     )
 
     if period is None:
-        period = _fringe_period(grid, values, step, period_range, region, min_prominence)
+        period, _ = _fringe_period_in_regions(
+            grid, values, step, period_range, region, min_prominence
+        )
     else:
         period = float(period)
         if not np.isfinite(period) or period < 2.0 * step:
@@ -743,3 +777,112 @@ def distinguishing_labels(labels, keep_prefix=False):
         if all(candidate) and len(set(candidate)) == len(candidate):
             return finish(candidate)
     return labels if keep_prefix else labels
+
+def load_two_column(filename):
+    """Read a two-column text or CSV file: (x, y) as float arrays.
+
+    Accepts commas, semicolons, tabs or spaces between the columns. Lines that
+    are blank or not numbers (such as a header) are skipped, and any extra
+    columns are ignored. Use this for the solvent spectra, which may be CSV.
+    Raises ValueError if fewer than three numeric lines are found.
+    """
+    import re
+
+    x, y = [], []
+    with open(filename, "r", encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            parts = [p for p in re.split(r"[,;\t ]+", line.strip()) if p]
+            if len(parts) < 2:
+                continue
+            try:
+                x.append(float(parts[0]))
+                y.append(float(parts[1]))
+            except ValueError:
+                continue  # header or comment line
+    if len(x) < 3:
+        raise ValueError(f"{filename}: fewer than three lines of numeric data (two columns).")
+    return np.array(x), np.array(y)
+
+
+def remove_bulk_solvent(
+    frequencies,
+    delta_alpha,
+    solvent_alpha_freq,
+    solvent_alpha,
+    solvent_epsilon_freq,
+    solvent_epsilon,
+    total_concentration,
+    solvent_mole_fraction,
+):
+    """Estimate the molar absorption coefficient of the solute from a difference
+    absorption coefficient measured against a solvent reference.
+
+    delta_alpha is assumed to be alpha_sample - alpha_solvent (cm^-1). Then
+
+        alpha_solution = delta_alpha + alpha_solvent(nu)             (cm^-1)
+        epsilon        = (alpha_solution / c_total
+                          - x_solvent * epsilon_solvent(nu))
+                         / (1 - x_solvent)                           (L mol^-1 cm^-1)
+
+    Why the division by (1 - x_solvent): alpha_solution = c_total * (x_solute *
+    epsilon_solute + x_solvent * epsilon_solvent). Dividing by c_total and
+    subtracting the solvent term leaves x_solute * epsilon_solute, so dividing by
+    the solute mole fraction x_solute = 1 - x_solvent gives epsilon_solute.
+
+    Parameters
+    ----------
+    frequencies, delta_alpha : arrays
+        The spectrum (wavenumber in cm^-1, difference absorption coefficient in cm^-1).
+    solvent_alpha_freq, solvent_alpha : arrays
+        Absorption coefficient of the bulk solvent (cm^-1), e.g. water at the
+        measurement temperature.
+    solvent_epsilon_freq, solvent_epsilon : arrays
+        Molar absorption coefficient of the solvent (L mol^-1 cm^-1).
+    total_concentration : float
+        Total concentration of the solution in mol/L
+        (total moles x solution density / solution mass). Must be positive.
+    solvent_mole_fraction : float
+        Moles of solvent / total moles in the solution, from 0 up to (not
+        including) 1.
+
+    The solvent spectra are interpolated onto `frequencies` (they may use any
+    order or spacing). Points that the solvent files do not cover, or where
+    `delta_alpha` is NaN, come out as NaN. Returns an array the same length
+    and order as `frequencies`. Raises ValueError for unusable input.
+
+    """
+    x = np.asarray(frequencies, dtype=float)
+    d = np.asarray(delta_alpha, dtype=float)
+    if x.shape != d.shape or x.ndim != 1:
+        raise ValueError("Wavenumbers and values must be 1D arrays of the same length.")
+    if not (np.isfinite(total_concentration) and total_concentration > 0):
+        raise ValueError("The total concentration must be a positive number (mol/L).")
+    if not (np.isfinite(solvent_mole_fraction) and 0.0 <= solvent_mole_fraction < 1.0):
+        raise ValueError("The solvent mole fraction must be at least 0 and less than 1.")
+
+    def on_axis(ref_freq, ref_values, name):
+        f = np.asarray(ref_freq, dtype=float)
+        v = np.asarray(ref_values, dtype=float)
+        ok = np.isfinite(f) & np.isfinite(v)
+        f, v = f[ok], v[ok]
+        if f.size < 3:
+            raise ValueError(f"The solvent {name} spectrum has too few valid points.")
+        order = np.argsort(f)  # np.interp needs an increasing axis
+        f, v = f[order], v[order]
+        tolerance = 0.5 * np.median(np.diff(f))  # absorbs tiny rounding differences at the ends
+        out = np.interp(x, f, v)
+        out[(x < f[0] - tolerance) | (x > f[-1] + tolerance)] = np.nan
+        if not np.isfinite(out).any():
+            raise ValueError(
+                f"The solvent {name} spectrum ({f[0]:.1f}-{f[-1]:.1f} cm⁻¹) "
+                "does not overlap the spectrum."
+            )
+        return out
+
+    alpha_solvent = on_axis(solvent_alpha_freq, solvent_alpha, "absorption")
+    epsilon_solvent = on_axis(solvent_epsilon_freq, solvent_epsilon, "molar absorption")
+
+    alpha_solution = d + alpha_solvent
+    return (
+        alpha_solution / total_concentration - solvent_mole_fraction * epsilon_solvent
+    ) / (1.0 - solvent_mole_fraction)

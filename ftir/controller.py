@@ -6,16 +6,18 @@ The controller connects the view's controls to the models:
     coefficient switch)
   * a water vapour reference file enables the water vapour switch
   * the fringe switch needs no extra file
+  * the bulk solvent switch converts to a molar absorption coefficient using each
+    pair's own solvent settings (needs the gap thickness)
   * the SVD button decomposes the displayed spectra
   * corrections are applied in this order: water vapour, fringes, then the
-    conversion to absorption coefficient
+    conversion to absorption coefficient, then solvent removal
   * Save CSV asks what to do when the displayed spectra use different
     wavenumber axes
 
 It uses these functions from models.py: load_spectrum, calculate_difference_absorbance,
 align_spectra, empty_cell_thickness, absorption_coefficient, correct_water_vapor,
-remove_fringes, group_by_axis, resample_to_common_axis, save_spectra, svd_spectra
-and save_svd.
+remove_bulk_solvent, load_two_column, remove_fringes, group_by_axis,
+resample_to_common_axis, save_spectra, svd_spectra and save_svd.
 """
 
 from pathlib import Path
@@ -24,11 +26,11 @@ from tkinter import filedialog, messagebox
 import numpy as np
 
 from ftir import models
-from ftir.views import FILETYPES, LoadPairsDialog, SVDDialog
+from ftir.views import FILETYPES, LoadPairsDialog, SolventDialog, SVDDialog
 
 
 class ProcessingError(Exception):
-    """A correction failed for a spectrum. `which` is "water" or "fringes"."""
+    """A correction failed for a spectrum. `which` is "water", "fringes" or "solvent"."""
 
     def __init__(self, which, message):
         super().__init__(message)
@@ -44,6 +46,7 @@ class Controller:
         self.fringe_skipped = []       # spectra the fringe correction had to skip
         self._skip_warned = set()      # ... that the user has already been told about
         self.water = None              # (wavenumbers, values) of the water vapour reference
+        self._solvent_files = {}       # path -> (modified time, wavenumbers, values)
 
         # Connect every control in the view to its action
         view.load_button.configure(command=self.load_files)
@@ -59,6 +62,8 @@ class Controller:
         view.display_switch.configure(command=self.toggle_display)
         view.water_switch.configure(command=self.toggle_display)
         view.fringe_switch.configure(command=self.toggle_display)
+        view.solvent_switch.configure(command=self.toggle_display)
+        view.solvent_button.configure(command=self.edit_solvent)
 
     # ------------------------------------------------------------------
     # Sample/reference pairs
@@ -67,7 +72,8 @@ class Controller:
         """Add new pairs and/or remove loaded ones, using one dialog.
 
         The dialog lists the pairs already loaded; the ones the user leaves in
-        stay as they are, and any new pairs are added after them.
+        stay in their position and are all read again from the files shown in the
+        dialog, and any new pairs are added after them.
         """
         existing = [(s["label"], s["sample_file"], s["reference_file"]) for s in self.spectra]
         dialog = LoadPairsDialog(self.view, existing)
@@ -77,13 +83,22 @@ class Controller:
             return
 
         kept = [self.spectra[i] for i in dialog.kept]
-        new_spectra = []
+        reloaded, new_spectra = [], []
         try:
+            # Every kept pair is read again from its files, keeping its position
+            # and its solvent settings
+            for position, index in enumerate(dialog.kept):
+                if index in dialog.reloaded:
+                    sample_file, reference_file = dialog.reloaded[index]
+                    fresh = self._process_pair(position + 1, sample_file, reference_file)
+                    fresh["solvent"] = kept[position].get("solvent")
+                    kept[position] = fresh
+                    reloaded.append(fresh)
             for offset, (sample_file, reference_file) in enumerate(dialog.result):
                 number = len(kept) + offset + 1  # new pairs follow the largest number
                 new_spectra.append(self._process_pair(number, sample_file, reference_file))
         except (OSError, ValueError) as err:
-            # If any new pair fails, nothing changes (removals included)
+            # If any pair fails, nothing changes (removals and reloads included)
             messagebox.showerror("Could not load files", str(err), parent=self.view)
             return
 
@@ -96,7 +111,7 @@ class Controller:
         self._skip_warned = {renamed[l] for l in self._skip_warned if l in renamed}
 
         self.spectra = kept + new_spectra
-        self._warn_about_bad_points(new_spectra)
+        self._warn_about_bad_points(reloaded + new_spectra)
         self._redraw()
 
     def clear_spectra(self):
@@ -183,6 +198,61 @@ class Controller:
     def toggle_display(self):
         """Called when any of the switches is flipped. Keeps the current zoom."""
         self._redraw(keep_view=True)
+
+    # ------------------------------------------------------------------
+    # Bulk solvent
+    # ------------------------------------------------------------------
+    def edit_solvent(self):
+        """Open the dialog for each pair's solvent files, concentration and mole fraction."""
+        if not self.spectra:
+            messagebox.showinfo("Solvent settings", "Load at least one pair first.", parent=self.view)
+            return
+        rows = [(s["label"], s.get("solvent")) for s in self.spectra]
+        dialog = SolventDialog(self.view, rows, self._validate_solvent)
+        self.view.wait_window(dialog)
+        if dialog.result is None:  # cancelled
+            return
+        for s, params in zip(self.spectra, dialog.result):
+            s["solvent"] = params
+        self._redraw()  # new numbers change the scale, so show the full view
+
+    def _load_solvent_file(self, path):
+        """Read a two-column solvent spectrum (cached until the file changes)."""
+        modified = Path(path).stat().st_mtime
+        cached = self._solvent_files.get(path)
+        if cached is None or cached[0] != modified:
+            x, y = models.load_two_column(path)
+            self._solvent_files[path] = (modified, x, y)
+            cached = self._solvent_files[path]
+        return cached[1], cached[2]
+
+    def _validate_solvent(self, result):
+        """Called by the dialog: try every chosen file and its overlap with the spectrum.
+
+        Raises ValueError (shown in the dialog, which stays open) if anything is wrong.
+        """
+        for s, params in zip(self.spectra, result):
+            if params is None:
+                continue
+            try:
+                self._convert_solvent(params, s["frequency"], np.zeros_like(s["frequency"]))
+            except (OSError, ValueError) as err:
+                raise ValueError(f"{s['label']}: {err}") from err
+
+    def _convert_solvent(self, params, frequency, values):
+        """Difference absorption coefficient -> molar absorption coefficient."""
+        alpha_f, alpha_v = self._load_solvent_file(params["alpha_file"])
+        eps_f, eps_v = self._load_solvent_file(params["epsilon_file"])
+        return models.remove_bulk_solvent(
+            frequency, values, alpha_f, alpha_v, eps_f, eps_v,
+            params["concentration"], params["mole_fraction"],
+        )
+
+    def _remove_solvent(self, spectrum, frequency, values):
+        try:
+            return self._convert_solvent(spectrum["solvent"], frequency, values)
+        except (OSError, ValueError) as err:
+            raise ProcessingError("solvent", f"{spectrum['label']}: {err}") from err
 
     # ------------------------------------------------------------------
     # Singular value decomposition
@@ -275,9 +345,21 @@ class Controller:
 
         Raises ProcessingError if a correction fails for a spectrum.
         """
-        use_coefficient = self.view.coefficient_mode() and self.cell_thickness_um is not None
+        have_thickness = self.cell_thickness_um is not None
+        use_solvent = self.view.solvent_mode() and have_thickness
+        # Solvent removal works on the absorption coefficient, so it implies the conversion
+        use_coefficient = (self.view.coefficient_mode() or use_solvent) and have_thickness
         use_water = self.view.water_mode() and self.water is not None
         use_fringes = self.view.fringe_mode()
+
+        if use_solvent:
+            missing = [s["label"] for s in self.spectra if not s.get("solvent")]
+            if missing:
+                raise ProcessingError(
+                    "solvent",
+                    "No solvent settings for:\n" + "\n".join(missing)
+                    + "\n\nEnter them with \"Solvent settings...\".",
+                )
 
         self.fringe_skipped = []  # (label, reason) of spectra without clear fringes
         spectra = []
@@ -301,6 +383,8 @@ class Controller:
 
             if use_coefficient:
                 values = models.absorption_coefficient(values, self.cell_thickness_um)
+            if use_solvent:
+                values = self._remove_solvent(s, frequency, values)
             spectra.append((label, frequency, values))
 
         if use_fringes and self.spectra and len(self.fringe_skipped) == len(self.spectra):
@@ -310,16 +394,20 @@ class Controller:
             )
 
         # CSV column names say which corrections were applied
-        y_name = "alpha_per_cm" if use_coefficient else "delta_A"
+        if use_solvent:
+            y_name = "epsilon_L_per_mol_cm"
+        else:
+            y_name = "alpha_per_cm" if use_coefficient else "delta_A"
         if use_water:
             y_name += "_no_water"
         if use_fringes:
             y_name += "_no_fringes"
-        ylabel = (
-            "Difference absorption coefficient (cm⁻¹)"
-            if use_coefficient
-            else "Difference absorbance, ΔA"
-        )
+        if use_solvent:
+            ylabel = "Solute molar absorption coefficient (L mol⁻¹ cm⁻¹)"
+        elif use_coefficient:
+            ylabel = "Difference absorption coefficient (cm⁻¹)"
+        else:
+            ylabel = "Difference absorbance, ΔA"
         return spectra, ylabel, y_name
 
     def _displayed_safe(self):
@@ -398,6 +486,7 @@ class Controller:
             "delta_A": delta_A,
             "sample_file": sample_file,
             "reference_file": reference_file,
+            "solvent": None,  # set with "Solvent settings...": files, concentration, mole fraction
         }
 
     def _warn_about_bad_points(self, spectra):
