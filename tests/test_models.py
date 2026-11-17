@@ -1,6 +1,6 @@
 import pytest
 import numpy.testing as npt
-from ftir.models import difference_absorbance
+from ftir.models import calculate_difference_absorbance
 
 @pytest.mark.parametrize('test_sample_intensities, test_reference_intensities, expected_output, expected_raises, error_message',
 [
