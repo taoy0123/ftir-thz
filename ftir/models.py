@@ -285,31 +285,66 @@ def _fringe_axis(wavenumbers, absorbance):
     return order, wn_sorted, grid, values, was_nan, step, uniform
 
 
-def _ripple_peak(grid, values, step, shortest, longest):
+def _ripple_peak(grid, values, step, shortest, longest, keep=None):
     """Strongest ripple with a period between `shortest` and `longest` (cm^-1).
 
     Works on one stretch of an evenly spaced, NaN-free spectrum. Returns
     (period, prominence), or None if the stretch is too short or the strongest
     peak sits at the edge of the search band (so it is not a real peak).
     Prominence is the peak height divided by the typical (median) height.
+
+    keep (optional, same length): 1 for points to use, 0 for points to ignore
+    (water vapour lines). Ignored points do not contribute to the baseline or
+    to the ripple spectrum.
     """
     span = grid[-1] - grid[0] if grid.size else 0.0
     if grid.size < 16 or span < longest:
         return None
+    if keep is None:
+        keep = np.ones(values.size)
+    if keep.sum() < 16:
+        return None
 
-    # Remove everything broader than the fringes (bands, baseline, cell fringes)
+    # Remove everything broader than the fringes (bands, baseline, cell fringes).
+    # The moving average uses only the points that are kept.
     half = int(round(min(5.0 * longest, span / 2.0) / step)) // 2
     half = max(1, min(half, values.size - 1))
-    padded = np.pad(values, half, mode="reflect")
-    ripple = values - np.convolve(padded, np.ones(2 * half + 1) / (2 * half + 1), mode="valid")
+    box = np.ones(2 * half + 1)
+    total = np.convolve(np.pad(values * keep, half, mode="reflect"), box, mode="valid")
+    count = np.convolve(np.pad(keep, half, mode="reflect"), box, mode="valid")
+    baseline = np.where(count >= 3, total / np.maximum(count, 1e-12), 0.0)
+    ripple = (values - baseline) * keep
 
-    # Spectrum of the ripple; zero-padding gives a finely sampled peak
-    n_fft = 1 << int(np.ceil(np.log2(ripple.size * 16)))
-    amplitude = np.abs(np.fft.rfft(ripple * np.hanning(ripple.size), n=n_fft))
-    frequency = np.fft.rfftfreq(n_fft, d=step)  # cycles per cm^-1
-    band = np.flatnonzero((frequency >= 1.0 / longest) & (frequency <= 1.0 / shortest))
-    if band.size < 3:
-        return None
+    if np.any(keep == 0):
+        # Gaps (masked points): a fixed-grid FFT would leak badly, so fit a sine
+        # and cosine at each trial frequency to the kept points only
+        # (a Lomb-Scargle style scan, which handles gaps correctly).
+        used = keep > 0
+        x = grid[used] - grid[used].mean()
+        r = ripple[used]
+        weight = np.hanning(values.size)[used] + 1e-3
+        resolution = 1.0 / span
+        frequency = np.arange(1.0 / longest, 1.0 / shortest + resolution / 16, resolution / 8)
+        if frequency.size < 3:
+            return None
+        angle = 2.0 * np.pi * frequency[:, None] * x[None, :]
+        cos, sin = np.cos(angle), np.sin(angle)
+        cc, ss, cs = (weight * cos * cos).sum(1), (weight * sin * sin).sum(1), (weight * cos * sin).sum(1)
+        yc, ys = cos @ (weight * r), sin @ (weight * r)
+        determinant = np.maximum(cc * ss - cs**2, 1e-12)
+        power = ((yc * ss - ys * cs) * yc + (ys * cc - yc * cs) * ys) / determinant
+        amplitude = np.sqrt(np.maximum(power, 0.0))
+        band = np.arange(frequency.size)
+        step_frequency = frequency[1] - frequency[0]
+    else:
+        # Spectrum of the ripple; zero-padding gives a finely sampled peak
+        n_fft = 1 << int(np.ceil(np.log2(ripple.size * 16)))
+        amplitude = np.abs(np.fft.rfft(ripple * np.hanning(ripple.size), n=n_fft))
+        frequency = np.fft.rfftfreq(n_fft, d=step)  # cycles per cm^-1
+        band = np.flatnonzero((frequency >= 1.0 / longest) & (frequency <= 1.0 / shortest))
+        step_frequency = frequency[1] - frequency[0]
+        if band.size < 3:
+            return None
 
     peak = band[np.argmax(amplitude[band])]
     if peak == band[0] or peak == band[-1]:
@@ -320,10 +355,12 @@ def _ripple_peak(grid, values, step, shortest, longest):
     a, b, c = amplitude[peak - 1], amplitude[peak], amplitude[peak + 1]
     denominator = a - 2.0 * b + c
     offset = 0.5 * (a - c) / denominator if denominator != 0 else 0.0
-    return 1.0 / (frequency[peak] + offset * (frequency[1] - frequency[0])), prominence
+    return 1.0 / (frequency[peak] + offset * step_frequency), prominence
 
 
-def _fringe_period(grid, values, step, period_range, region, min_prominence, tolerance=0.05):
+def _fringe_period(
+    grid, values, step, period_range, region, min_prominence, tolerance=0.05, keep=None
+):
     """Measure the fringe period (cm^-1), or raise ValueError if there are no clear fringes.
 
     Two tests guard against mistaking other structure for fringes. The ripple
@@ -338,12 +375,15 @@ def _fringe_period(grid, values, step, period_range, region, min_prominence, tol
         raise ValueError("period_range does not suit the point spacing of this spectrum.")
 
     if region is not None:
-        keep = (grid >= region[0]) & (grid <= region[1])
-        grid, values = grid[keep], values[keep]
+        inside = (grid >= region[0]) & (grid <= region[1])
+        grid, values = grid[inside], values[inside]
+        keep = None if keep is None else keep[inside]
     if grid.size < 16 or grid[-1] - grid[0] < longest:
         raise ValueError("The wavenumber region is too short to measure the fringe period.")
+    if keep is not None and keep.sum() < 16:
+        raise ValueError("Too little of this region is left once the water vapour lines are masked.")
 
-    found = _ripple_peak(grid, values, step, shortest, longest)
+    found = _ripple_peak(grid, values, step, shortest, longest, keep)
     if found is None or found[1] < min_prominence:
         raise ValueError(
             "No clear fringes found. Check period_range, give the period directly, "
@@ -354,7 +394,10 @@ def _fringe_period(grid, values, step, period_range, region, min_prominence, tol
     if grid[-1] - grid[0] >= 6.0 * longest:
         agreeing = 0
         for part in np.array_split(np.arange(grid.size), 3):
-            result = _ripple_peak(grid[part], values[part], step, shortest, longest)
+            result = _ripple_peak(
+                grid[part], values[part], step, shortest, longest,
+                None if keep is None else keep[part],
+            )
             if result is not None and abs(result[0] - period) <= tolerance * period:
                 agreeing += 1
         if agreeing < 2:
@@ -365,8 +408,42 @@ def _fringe_period(grid, values, step, period_range, region, min_prominence, tol
             )
     return period
 
+def _vapour_free(grid, step, vapour, level=3.0, margin=2.0):
+    """1 where the spectrum is free of water vapour lines, 0 where it is not.
 
-def _fringe_period_in_regions(grid, values, step, period_range, region, min_prominence):
+    `vapour` is (wavenumbers, values) of a water vapour spectrum. Its slow trend
+    (a 30 cm^-1 moving average) is removed so only lines remain, and a point is
+    a line when it is more than `level` times the local noise (a running median
+    of |lines| over 100 cm^-1, so a noisy stretch of the reference does not hide
+    lines elsewhere). Every line is widened by `margin` cm^-1 on both sides.
+    """
+    wf = np.asarray(vapour[0], dtype=float)
+    wv = np.asarray(vapour[1], dtype=float)
+    ok = np.isfinite(wf) & np.isfinite(wv)
+    wf, wv = wf[ok], wv[ok]
+    if wf.size < 3:
+        raise ValueError("The water vapour spectrum has too few valid points.")
+    order = np.argsort(wf)
+    ref = np.interp(grid, wf[order], wv[order], left=0.0, right=0.0)
+
+    half = max(int(round(30.0 / step)) // 2, 1)
+    ref_padded = np.pad(ref, half, mode="reflect")
+    lines = np.abs(ref - np.convolve(ref_padded, np.ones(2 * half + 1) / (2 * half + 1), mode="valid"))
+
+    window = min(int(round(100.0 / step)) | 1, 2 * (lines.size // 2) - 1)
+    windows = np.lib.stride_tricks.sliding_window_view(
+        np.pad(lines, window // 2, mode="reflect"), window
+    )
+    noise = 1.4826 * np.median(windows, axis=1)
+    strong = (lines > level * noise) & (lines > 0)
+
+    spread = int(np.ceil(margin / step))
+    strong = np.convolve(strong.astype(float), np.ones(2 * spread + 1), mode="same") > 0
+    return (~strong).astype(float)
+
+def _fringe_period_in_regions(
+    grid, values, step, period_range, region, min_prominence, keep=None
+):
     """Measure the fringe period in the first region that shows clear fringes.
 
     `region` is None (whole spectrum), one (low, high) pair, or a sequence of
@@ -385,7 +462,9 @@ def _fringe_period_in_regions(grid, values, step, period_range, region, min_prom
     problems = []
     for candidate in candidates:
         try:
-            period = _fringe_period(grid, values, step, period_range, candidate, min_prominence)
+            period = _fringe_period(
+                grid, values, step, period_range, candidate, min_prominence, keep=keep
+            )
             return period, candidate
         except ValueError as err:
             name = "whole spectrum" if candidate is None else f"{candidate[0]:g}-{candidate[1]:g} cm\u207b\u00b9"
@@ -394,14 +473,16 @@ def _fringe_period_in_regions(grid, values, step, period_range, region, min_prom
         raise ValueError(problems[0].split(": ", 1)[1])
     raise ValueError("No clear fringes in any region.\n" + "\n".join(problems))
 
-
 def remove_fringes(
     wavenumbers,
     absorbance,
     period=None,
     period_range=(2.0, 10.0),
-    region=((30.0, 100.0), (140, 200)),
+    region=((30.0, 100.0), (140.0, 200.0)),
     min_prominence=5.0,
+    vapour=None,
+    vapour_level=3.0,
+    vapour_margin=2.0,
 ):
     """Suppress etalon fringes (e.g. from diamond windows) by half-period averaging.
 
@@ -434,6 +515,18 @@ def remove_fringes(
     min_prominence : float
         How many times higher than the typical ripple the fringe peak must be
         for the fringes to count as clear. Lower it only if you trust weak fringes.
+    vapour : (wavenumbers, values), optional
+        A water vapour spectrum. Where it has lines, the spectrum is ignored
+        when the fringe PERIOD is measured, so residual vapour peaks cannot
+        be mistaken for fringes or hide them. (The correction itself still
+        uses every point.) Each spectrum is measured on its own: nothing is
+        shared between pairs, so pairs measured with different windows each
+        get their own period.
+    vapour_level : float
+        A vapour point counts as a line when it is this many times above the
+        local noise of the vapour spectrum. Lower masks more.
+    vapour_margin : float
+        Width in cm^-1 added on each side of every line that is ignored.
 
     Returns
     -------
@@ -463,8 +556,9 @@ def remove_fringes(
     )
 
     if period is None:
+        keep = None if vapour is None else _vapour_free(grid, step, vapour, vapour_level, vapour_margin)
         period, _ = _fringe_period_in_regions(
-            grid, values, step, period_range, region, min_prominence
+            grid, values, step, period_range, region, min_prominence, keep
         )
     else:
         period = float(period)

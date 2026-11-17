@@ -589,12 +589,12 @@ class View(ctk.CTk):
         self.thickness_label.pack(padx=15, pady=(0, 10), anchor="w")
 
         ctk.CTkLabel(panel, text="Corrections", font=bold).pack(padx=15, pady=(10, 5))
-        self.water_switch = ctk.CTkSwitch(panel, text="Water vapour removed", state="disabled")
+        self.water_switch = ctk.CTkSwitch(panel, text="Water vapour lines minimised", state="disabled")
         self.water_switch.pack(padx=15, pady=5, anchor="w")
         ctk.CTkLabel(
             panel, text="Needs a water vapour file", justify="left", text_color="gray"
         ).pack(padx=15, pady=(0, 5), anchor="w")
-        self.fringe_switch = ctk.CTkSwitch(panel, text="Fringes removed")
+        self.fringe_switch = ctk.CTkSwitch(panel, text="Fringes minimised")
         self.fringe_switch.pack(padx=15, pady=5, anchor="w")
         ctk.CTkLabel(
             panel, text="Diamond window etalon\n(half-period average)",

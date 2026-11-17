@@ -375,7 +375,8 @@ class Controller:
             label = s["label"]
             if use_fringes:
                 try:
-                    values, _ = models.remove_fringes(frequency, values)
+                    # Residual water vapour lines are ignored when measuring the period
+                    values, _ = models.remove_fringes(frequency, values, vapour=self.water)
                 except ValueError as err:
                     # No clear fringes in this one: show it uncorrected, carry on
                     self.fringe_skipped.append((label, str(err)))
