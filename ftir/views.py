@@ -392,7 +392,7 @@ class SVDDialog(ctk.CTkToplevel):
     after changing switches or loading spectra.
     """
 
-    def __init__(self, parent, compute, save):
+    def __init__(self, parent, compute, save, state=None, signature=None):
         super().__init__(parent)
         self.title("Singular value decomposition")
         self.geometry("1100x640")
@@ -401,6 +401,10 @@ class SVDDialog(ctk.CTkToplevel):
         self._save = save
         self.result = None   # as computed
         self.flipped = set() # indices of components whose sign is flipped
+        # `state` is a dict owned by the controller: it is filled when this window
+        # closes and used by the next window to restore the settings and, if the
+        # displayed data are unchanged (`signature()` equal), the results too.
+        self.memory = state if state is not None else {}
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -431,7 +435,30 @@ class SVDDialog(ctk.CTkToplevel):
         self.info = ctk.CTkLabel(self, text="", justify="left", anchor="w")
         self.info.grid(row=3, column=0, padx=15, pady=(5, 12), sticky="ew")
 
-        self.after(100, self.run)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        saved = self.memory
+        self.low_var.set(saved.get("low", ""))
+        self.high_var.set(saved.get("high", ""))
+        if saved.get("center"):
+            self.center_switch.select()
+        cached = saved.get("result")
+        if cached is not None and signature is not None and cached.get("signature") == signature():
+            self.result = cached
+            self.flipped = set(saved.get("flipped", ()))
+            self._build_flip_boxes()
+            self._draw()
+        else:
+            self.after(100, self.run)
+
+    def _close(self):
+        self.memory.update(
+            low=self.low_var.get(),
+            high=self.high_var.get(),
+            center=bool(self.center_switch.get()),
+            result=self.result,
+            flipped=set(self.flipped),
+        )
+        self.destroy()
 
     def _limit(self, variable, name):
         text = variable.get().strip()
@@ -589,12 +616,12 @@ class View(ctk.CTk):
         self.thickness_label.pack(padx=15, pady=(0, 10), anchor="w")
 
         ctk.CTkLabel(panel, text="Corrections", font=bold).pack(padx=15, pady=(10, 5))
-        self.water_switch = ctk.CTkSwitch(panel, text="Water vapour lines minimised", state="disabled")
+        self.water_switch = ctk.CTkSwitch(panel, text="Water vapour removed", state="disabled")
         self.water_switch.pack(padx=15, pady=5, anchor="w")
         ctk.CTkLabel(
             panel, text="Needs a water vapour file", justify="left", text_color="gray"
         ).pack(padx=15, pady=(0, 5), anchor="w")
-        self.fringe_switch = ctk.CTkSwitch(panel, text="Fringes minimised")
+        self.fringe_switch = ctk.CTkSwitch(panel, text="Fringes removed")
         self.fringe_switch.pack(padx=15, pady=5, anchor="w")
         ctk.CTkLabel(
             panel, text="Diamond window etalon\n(half-period average)",

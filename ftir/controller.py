@@ -43,6 +43,7 @@ class Controller:
         self.spectra = []              # one dict per pair: label, frequency, delta_A, file paths
         self.cell_thickness_um = None  # set when empty cell and background are both valid
         self._svd_dialog = None
+        self._svd_state = {}  # settings/results kept between SVD windows
         self.fringe_skipped = []       # spectra the fringe correction had to skip
         self._skip_warned = set()      # ... that the user has already been told about
         self.water = None              # (wavenumbers, values) of the water vapour reference
@@ -266,13 +267,36 @@ class Controller:
             self._svd_dialog.lift()
             self._svd_dialog.run()  # refresh with whatever is displayed now
             return
-        self._svd_dialog = SVDDialog(self.view, self._run_svd, self._save_svd)
+        self._svd_dialog = SVDDialog(
+            self.view, self._run_svd, self._save_svd,
+            state=self._svd_state, signature=self._svd_signature,
+        )
+
+    def _svd_signature(self):
+        """Fingerprint of the displayed spectra: equal when nothing that matters changed
+        (switching something and switching it back gives the same fingerprint)."""
+        return self._fingerprint(*self._displayed_safe_pair())
+
+    def _displayed_safe_pair(self):
+        spectra, _, y_name = self._displayed_safe()
+        return spectra, y_name
+
+    @staticmethod
+    def _fingerprint(spectra, y_name):
+        import hashlib
+        digest = hashlib.sha1(y_name.encode())
+        for label, frequency, values in spectra:
+            digest.update(str(label).encode())
+            digest.update(np.ascontiguousarray(frequency, dtype=float).tobytes())
+            digest.update(np.ascontiguousarray(values, dtype=float).tobytes())
+        return digest.hexdigest()
 
     def _run_svd(self, low, high, center):
         """Called by the SVD window. Uses the spectra exactly as displayed."""
         spectra, _, y_name = self._displayed_safe()
         result = models.svd_spectra(spectra, (low, high), n_components=4, center=center)
         result["source"] = f"{len(spectra)} spectra, {y_name}"
+        result["signature"] = self._fingerprint(spectra, y_name)
         return result
 
     def _save_svd(self, result):
