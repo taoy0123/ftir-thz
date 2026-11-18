@@ -1,7 +1,7 @@
-# Overview
-This program provides an user interface for calculating and displaying FTIR spectra. THe features were developed with aqueous solution samples being measured in the frequency range of 30 to 650 cm-1. The default input format is text with wavenumbers in cm-1 on the left column, and intensities in arbitrary units on the right column (i.e., the default format raw exports from OPUS - the software used with Bruker VERTEX series FTIR spectrocmeters).
+# FTIR-THz
+FTIR-THz is a graphical user interface that calculates and displays FTIR spectra. The features were developed with aqueous solution samples in mind, although it may be applied to other types of samples consisting of solvent and solutes. THz signifies that the spectra processing techniques apply to frequency range of 30 to 650 cm-1. The default input format: wavenumbers in cm-1 on the left column, and intensities in arbitrary units on the right column, saved as .txt. The default input format suits exports from OPUS - the software used with Bruker VERTEX series FTIR spectrocmeters.
 
-# Features
+## Main features
 - Calculates the difference in absorbance for a given sample and a reference (i.e., A_sample - A_reference).
 - Calculates the empty cell thickness for a given empty cell and a background.
 - Minimises water vapour absorption lines by subtracting an automatically scaled water vapur spectrum. Specify the water vapour lines by selecting _WaterVapor.txt_.
@@ -19,7 +19,7 @@ This program provides an user interface for calculating and displaying FTIR spec
     - The known spectral components can be in .csv or .txt format.
     - Non-negativity can be enforced on scores and/or unknown components for physically meaningful results.
 
-## How to read the residual plots
+### How to read the residual plots
 The residual is measured minus fitted, so it shows what your components fail to explain. Ideally it is small, noise-like and has no consistent features.
 
 1. Residual spectra: look for peaks or humps that repeat across spectra. A repeated feature means a missing component.
@@ -27,12 +27,14 @@ The residual is measured minus fitted, so it shows what your components fail to 
 3. Heat map: vertical stripes mean a missing feature at that frequency. Horizontal bands mean particular spectra fit poorly. A pattern that drifts down the rows means something is evolving that the model misses.
 4. Mean residual: it should sit at zero. If it doesn’t, you are consistently under- or over-fitting at those frequencies.
 
+## Prerequisites
 Please refer to _requirements.txt_ for required packages. If using venv, import the required packages by:
 ```bash
 python -m pip install -r requirements.txt --editable .
 ```
 
-Start the user interface from the terminal:
+## Quick start guide
+Start the program from the terminal:
 ```bash
 python3 -m ftir.main
 ```
