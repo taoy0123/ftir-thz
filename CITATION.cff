@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it using the metadata below."
+title: "ftir-thz: Process and analyse FTIR spectra"
+type: software
+version: 0.0.0
+authors:
+  - family-names: Tao
+    given-names: Yu Heng
+    orcid: "https://orcid.org/0000-0001-8028-5023"
+license: MIT
+abstract: >-
+  Desktop application for processing terahertz FTIR spectra: difference
+  absorbance and absorption coefficient of sample/reference pairs, water vapour
+  and etalon fringe removal, bulk solvent removal, singular value decomposition
+  and multivariate curve resolution.
+# Add these once the project is on GitHub / Zenodo:
+repository-code: "https://github.com/taoy0123/ftir-thz"
+# doi: "10.5281/zenodo.XXXXXXX"
+date-released: "2026-11-18"

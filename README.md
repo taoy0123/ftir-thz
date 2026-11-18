@@ -38,3 +38,13 @@ Start the program from the terminal:
 ```bash
 python3 -m ftir.main
 ```
+
+## License
+This project is released under the MIT License. You are free to use, modify and share it, including in your own projects, as long as the copyright and licence notice stay with the code.
+
+## How to cite
+The licence does not require it, but if you use this software in work that you publish (a paper, thesis or report), please cite it. GitHub's "Cite this repository" button gives the reference from CITATION.cff. In short:
+
+> Tao, Y. H. ftir-thz: Process and analyse FTIR spectra (version 0.0.0). ORCID: 0000-0001-8028-5023.
+
+Please also name the version you used, because the methods (fringe removal, water vapour correction, MCR) may change between versions.

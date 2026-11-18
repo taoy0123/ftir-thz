@@ -11,14 +11,15 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "matplotlib",
-    "customtkinter",
-    "scipy",
+    "customtkinter"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "scipy"
 ]
 
 [tool.setuptools]
 packages = ["ftir"]    # name of the folder containing __init__.py (use underscores)
+license = "MIT"
