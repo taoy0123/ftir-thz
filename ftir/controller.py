@@ -17,7 +17,8 @@ The controller connects the view's controls to the models:
 It uses these functions from models.py: load_spectrum, calculate_difference_absorbance,
 align_spectra, empty_cell_thickness, absorption_coefficient, correct_water_vapor,
 remove_bulk_solvent, load_two_column, remove_fringes, group_by_axis,
-resample_to_common_axis, save_spectra, svd_spectra and save_svd.
+resample_to_common_axis, save_spectra, svd_spectra, save_svd,
+load_known_spectra, mcr_spectra and save_mcr.
 """
 
 from pathlib import Path
@@ -26,7 +27,7 @@ from tkinter import filedialog, messagebox
 import numpy as np
 
 from ftir import models
-from ftir.views import FILETYPES, LoadPairsDialog, SolventDialog, SVDDialog
+from ftir.views import FILETYPES, LoadPairsDialog, MCRDialog, SolventDialog, SVDDialog
 
 
 class ProcessingError(Exception):
@@ -44,6 +45,8 @@ class Controller:
         self.cell_thickness_um = None  # set when empty cell and background are both valid
         self._svd_dialog = None
         self._svd_state = {}  # settings/results kept between SVD windows
+        self._mcr_dialog = None
+        self._mcr_state = {}  # settings, known spectra and results kept between MCR windows
         self.fringe_skipped = []       # spectra the fringe correction had to skip
         self._skip_warned = set()      # ... that the user has already been told about
         self.water = None              # (wavenumbers, values) of the water vapour reference
@@ -54,6 +57,7 @@ class Controller:
         view.save_button.configure(command=self.save_csv)
         view.clear_button.configure(command=self.clear_spectra)
         view.svd_button.configure(command=self.show_svd)
+        view.mcr_button.configure(command=self.show_mcr)
         view.empty_button.configure(command=self.choose_empty_cell)
         view.empty_clear.configure(command=self.clear_empty_cell)
         view.background_button.configure(command=self.choose_background)
@@ -318,6 +322,69 @@ class Controller:
             "SVD saved",
             "Saved:\n" + "\n".join(Path(f).name for f in files),
             parent=self._svd_dialog,
+        )
+
+    # ------------------------------------------------------------------
+    # Multivariate curve resolution
+    # ------------------------------------------------------------------
+    def show_mcr(self):
+        """Open the MCR window for the spectra currently displayed."""
+        if len(self.spectra) < 2:
+            messagebox.showinfo("MCR", "Load at least two spectra first.", parent=self.view)
+            return
+        if self._mcr_dialog is not None and self._mcr_dialog.winfo_exists():
+            self._mcr_dialog.lift()
+            return
+        self._mcr_dialog = MCRDialog(
+            self.view, self._run_mcr, self._pick_known, self._save_mcr,
+            state=self._mcr_state, signature=self._svd_signature,
+        )
+
+    def _pick_known(self):
+        """Ask for files with known spectra (one or more); returns (label, x, y) tuples."""
+        paths = filedialog.askopenfilenames(
+            parent=self._mcr_dialog or self.view,
+            title="Select known spectra (CSV with wavenumber in the first column, or two-column text)",
+            filetypes=[("Spectra", "*.csv *.txt"), ("All files", "*.*")],
+        )
+        known = []
+        for path in paths or ():
+            try:
+                known.extend(models.load_known_spectra(path))
+            except OSError as err:
+                raise ValueError(f"{Path(path).name}: {err}") from err
+        return known
+
+    def _run_mcr(self, low, high, known, n_unknown, nonneg_scores, nonneg_spectra):
+        """Called by the MCR window. Uses the spectra exactly as displayed."""
+        spectra, _, y_name = self._displayed_safe()
+        result = models.mcr_spectra(
+            spectra, known, n_unknown, (low, high),
+            nonneg_scores=nonneg_scores, nonneg_spectra=nonneg_spectra,
+        )
+        result["source"] = f"{len(spectra)} spectra, {y_name}"
+        result["signature"] = self._fingerprint(spectra, y_name)
+        return result
+
+    def _save_mcr(self, result):
+        path = filedialog.asksaveasfilename(
+            parent=self._mcr_dialog or self.view,
+            title="Save MCR results (four files are written)",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="mcr.csv",
+        )
+        if not path:
+            return
+        try:
+            files = models.save_mcr(path, result)
+        except OSError as err:
+            messagebox.showerror("Could not save file", str(err), parent=self._mcr_dialog)
+            return
+        messagebox.showinfo(
+            "MCR saved",
+            "Saved:\n" + "\n".join(Path(f).name for f in files),
+            parent=self._mcr_dialog,
         )
 
     def save_csv(self):

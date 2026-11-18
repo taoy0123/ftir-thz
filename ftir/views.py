@@ -9,6 +9,7 @@ Main window:
   * a label showing the gap thickness
   * a bulk solvent section: "Solvent settings..." button (SolventDialog) and a switch
   * an SVD button, and SVDDialog showing principal components, scores and % variation
+  * an MCR button, and MCRDialog (multivariate curve resolution with known spectra)
   * plot_spectra(spectra, ylabel) so the controller chooses the y-axis label
 """
 
@@ -551,6 +552,353 @@ class SVDDialog(ctk.CTkToplevel):
         )
 
 
+class MCRDialog(ctk.CTkToplevel):
+    """Window for multivariate curve resolution (MCR-ALS) of the displayed spectra.
+
+    compute(low, high, known, n_unknown, nonneg_scores, nonneg_spectra) -> result
+        dict (see models.mcr_spectra); it raises ValueError with a readable message.
+    pick_known() -> list of (label, wavenumbers, values) chosen by the user, or [].
+        It raises ValueError for a file that cannot be read.
+    save(result) is called by the Save button.
+    `state` (a dict owned by the controller) keeps the settings and results when
+    the window is closed; they come back when it is reopened, and the results are
+    shown again without recomputing if `signature()` (a fingerprint of the
+    displayed spectra) and all the settings are unchanged.
+    """
+
+    def __init__(self, parent, compute, pick_known, save, state=None, signature=None):
+        super().__init__(parent)
+        self.title("Multivariate curve resolution")
+        self.geometry("1150x700")
+        self.transient(parent)
+        self._compute = compute
+        self._pick_known = pick_known
+        self._save = save
+        self.memory = state if state is not None else {}
+        self.known = list(self.memory.get("known", []))
+        self.result = None
+        self.run_settings = None
+        self.flipped = set()   # indices of unknown components whose sign is flipped
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=0, column=0, padx=15, pady=(10, 0), sticky="w")
+        ctk.CTkLabel(bar, text="Wavenumber range (cm\u207b\u00b9):").pack(side="left")
+        self.low_var, self.high_var = tk.StringVar(), tk.StringVar()
+        ctk.CTkEntry(bar, textvariable=self.low_var, width=70, placeholder_text="from").pack(
+            side="left", padx=(8, 4)
+        )
+        ctk.CTkLabel(bar, text="to").pack(side="left")
+        ctk.CTkEntry(bar, textvariable=self.high_var, width=70, placeholder_text="to").pack(
+            side="left", padx=(4, 14)
+        )
+        ctk.CTkLabel(bar, text="Unknown components:").pack(side="left")
+        self.unknown_var = tk.StringVar(value="1")
+        ctk.CTkEntry(bar, textvariable=self.unknown_var, width=40).pack(side="left", padx=(8, 14))
+        self.scores_switch = ctk.CTkSwitch(bar, text="Scores \u2265 0")
+        self.scores_switch.pack(side="left", padx=(0, 10))
+        self.spectra_switch = ctk.CTkSwitch(bar, text="Unknown spectra \u2265 0")
+        self.spectra_switch.pack(side="left", padx=(0, 14))
+        ctk.CTkButton(bar, text="Run", width=80, command=self.run).pack(side="left")
+        ctk.CTkButton(bar, text="Save results...", width=120, command=self._on_save).pack(
+            side="left", padx=(10, 0)
+        )
+
+        self.known_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self.known_bar.grid(row=1, column=0, padx=15, pady=(8, 0), sticky="ew")
+
+        view_bar = ctk.CTkFrame(self, fg_color="transparent")
+        view_bar.grid(row=2, column=0, padx=15, pady=(8, 0), sticky="w")
+        self.view_buttons = ctk.CTkSegmentedButton(
+            view_bar, values=["Components", "Residuals"], command=lambda _: self._draw()
+        )
+        self.view_buttons.set(self.memory.get("view", "Components"))
+        self.view_buttons.pack(side="left")
+
+        self.figure = Figure(figsize=(10, 5), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas.get_tk_widget().grid(row=3, column=0, padx=15, pady=(6, 0), sticky="nsew")
+        self.flip_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self.flip_bar.grid(row=4, column=0, padx=15, pady=(5, 0), sticky="w")
+        self.info = ctk.CTkLabel(self, text="", justify="left", anchor="w", wraplength=1080)
+        self.info.grid(row=5, column=0, padx=15, pady=(5, 12), sticky="ew")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.low_var.set(self.memory.get("low", ""))
+        self.high_var.set(self.memory.get("high", ""))
+        self.unknown_var.set(self.memory.get("n_unknown", "1"))
+        if self.memory.get("nonneg_scores"):
+            self.scores_switch.select()
+        if self.memory.get("nonneg_spectra"):
+            self.spectra_switch.select()
+        self._build_known_bar()
+
+        cached = self.memory.get("result")
+        if (
+            cached is not None
+            and signature is not None
+            and cached.get("signature") == signature()
+            and self.memory.get("run_settings") == self._settings()
+        ):
+            self.result = cached
+            self.run_settings = self.memory["run_settings"]
+            self.flipped = set(self.memory.get("flipped", ()))
+            self._build_flip_boxes()
+            self._draw()
+        else:
+            self.info.configure(
+                text="Add known spectra (optional), choose the number of unknown components "
+                "and press Run."
+            )
+
+    # ---------------- settings ----------------
+    def _limit(self, variable, name):
+        text = variable.get().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError(f"'{text}' is not a number (wavenumber {name}).") from None
+
+    def _n_unknown(self):
+        text = self.unknown_var.get().strip()
+        try:
+            number = int(text)
+        except ValueError:
+            raise ValueError(f"'{text}' is not a whole number (unknown components).") from None
+        if number < 0:
+            raise ValueError("The number of unknown components cannot be negative.")
+        return number
+
+    def _settings(self):
+        """Everything that affects the result, in a form that can be compared."""
+        known = tuple(
+            (label, len(x), float(x[0]), float(x[-1]), float(np.nansum(y)))
+            for label, x, y in self.known
+        )
+        return (
+            self.low_var.get().strip(), self.high_var.get().strip(),
+            self.unknown_var.get().strip(),
+            bool(self.scores_switch.get()), bool(self.spectra_switch.get()), known,
+        )
+
+    # ---------------- known spectra ----------------
+    def _build_known_bar(self):
+        for child in self.known_bar.winfo_children():
+            child.destroy()
+        ctk.CTkButton(self.known_bar, text="Add known spectra...", width=150,
+                      command=self._add_known).pack(side="left")
+        if not self.known:
+            ctk.CTkLabel(self.known_bar, text="  none (all components are unknown)").pack(side="left")
+            return
+        for index, (label, _, _) in enumerate(self.known):
+            chip = ctk.CTkFrame(self.known_bar)
+            chip.pack(side="left", padx=(8, 0))
+            shown = label if len(label) <= 34 else label[:31] + "..."
+            ctk.CTkLabel(chip, text=shown).pack(side="left", padx=(8, 2))
+            ctk.CTkButton(chip, text="\u00d7", width=24, fg_color="gray",
+                          command=lambda i=index: self._remove_known(i)).pack(side="left", padx=(0, 4), pady=3)
+
+    def _add_known(self):
+        try:
+            added = self._pick_known()
+        except ValueError as err:
+            messagebox.showerror("Known spectra", str(err), parent=self)
+            return
+        self.known.extend(added)
+        self._build_known_bar()
+
+    def _remove_known(self, index):
+        del self.known[index]
+        self._build_known_bar()
+
+    # ---------------- running ----------------
+    def run(self):
+        try:
+            low, high = self._limit(self.low_var, "from"), self._limit(self.high_var, "to")
+            number = self._n_unknown()
+            settings = self._settings()
+            self.result = self._compute(
+                low, high, list(self.known), number,
+                bool(self.scores_switch.get()), bool(self.spectra_switch.get()),
+            )
+        except ValueError as err:
+            messagebox.showerror("MCR", str(err), parent=self)
+            return
+        self.run_settings = settings
+        # keep earlier flips that still refer to an unknown component
+        self.flipped = {i for i in self.flipped if self._can_flip(i)}
+        self._build_flip_boxes()
+        self._draw()
+
+    # ---------------- sign flips ----------------
+    def _flip_allowed(self):
+        """Flipping a component would break a non-negativity constraint, so it is off then."""
+        r = self.result
+        return r is not None and not (r["nonneg_scores"] or r["nonneg_spectra"])
+
+    def _can_flip(self, i):
+        return (
+            self._flip_allowed()
+            and i < len(self.result["is_known"])
+            and not self.result["is_known"][i]
+        )
+
+    def _build_flip_boxes(self):
+        """One "Flip" checkbox per UNKNOWN component (a known one has a meaningful sign)."""
+        for child in self.flip_bar.winfo_children():
+            child.destroy()
+        r = self.result
+        if r is None or all(r["is_known"]):
+            return
+        if not self._flip_allowed():
+            ctk.CTkLabel(
+                self.flip_bar,
+                text="Sign flip is unavailable while a non-negativity constraint is on.",
+            ).pack(side="left")
+            return
+        ctk.CTkLabel(self.flip_bar, text="Flip sign (spectrum and contribution):").pack(
+            side="left", padx=(0, 10)
+        )
+        for i, known in enumerate(r["is_known"]):
+            if known:
+                continue
+            box = ctk.CTkCheckBox(
+                self.flip_bar, text=r["component_labels"][i], width=90,
+                command=lambda i=i: self._toggle_flip(i),
+            )
+            if i in self.flipped:
+                box.select()
+            box.pack(side="left", padx=(0, 8))
+
+    def _toggle_flip(self, i):
+        self.flipped ^= {i}
+        self._draw()
+
+    def _signed(self):
+        """The result with the chosen unknown components (and their scores) sign-flipped.
+        The fit and residuals do not change: flipping both factors leaves the product alone."""
+        r = dict(self.result)
+        sign = np.array(
+            [-1.0 if i in self.flipped else 1.0 for i in range(r["components"].shape[0])]
+        )
+        r["components"] = r["components"] * sign[:, None]
+        r["scores"] = r["scores"] * sign[None, :]
+        return r
+
+    def _on_save(self):
+        if self.result is None:
+            messagebox.showinfo("MCR", "Nothing to save yet. Press Run first.", parent=self)
+            return
+        self._save(self._signed())  # saved with the signs as shown
+
+    def _close(self):
+        self.memory.update(
+            low=self.low_var.get(), high=self.high_var.get(),
+            n_unknown=self.unknown_var.get(),
+            nonneg_scores=bool(self.scores_switch.get()),
+            nonneg_spectra=bool(self.spectra_switch.get()),
+            known=list(self.known), view=self.view_buttons.get(),
+            result=self.result, run_settings=self.run_settings,
+            flipped=set(self.flipped),
+        )
+        self.destroy()
+
+    # ---------------- drawing ----------------
+    def _draw(self):
+        if self.result is None:
+            return
+        self.figure.clear()
+        if self.view_buttons.get() == "Residuals":
+            self._draw_residuals()
+        else:
+            self._draw_components()
+        self.canvas.draw()
+        r = self.result
+        state = "converged" if r["converged"] else "stopped at the iteration limit"
+        constraints = [name for name, on in (("scores \u2265 0", r["nonneg_scores"]),
+                                             ("unknown spectra \u2265 0", r["nonneg_spectra"])) if on]
+        self.info.configure(
+            text=f"Lack of fit {r['total_lack_of_fit']:.2f}% of the data norm   |   "
+            f"{r['n_iterations']} iterations ({state})   |   "
+            f"{len(r['labels'])} spectra, {len(r['component_labels'])} components"
+            + (f"   |   constraints: {', '.join(constraints)}" if constraints else "   |   no constraints")
+            + f"   |   {r.get('source', '')}"
+        )
+
+    def _short_labels(self):
+        return models.distinguishing_labels(self.result["labels"])
+
+    def _draw_components(self):
+        import textwrap
+
+        r = self._signed()
+        k = r["components"].shape[0]
+        n = len(r["labels"])
+        axes = self.figure.subplots(2, k, squeeze=False)
+        numbers = list(range(1, n + 1))
+        short = self._short_labels()
+        for i in range(k):
+            top, bottom = axes[0, i], axes[1, i]
+            top.plot(r["wavenumber"], r["components"][i], color="C0" if r["is_known"][i] else "C3")
+            top.set_title(textwrap.fill(r["component_labels"][i], 26), fontsize=9)
+            top.set_xlabel("Wavenumber (cm\u207b\u00b9)", fontsize=8)
+            bottom.plot(numbers, r["scores"][:, i], marker="o", linestyle="-",
+                        color="C0" if r["is_known"][i] else "C3")
+            bottom.set_xlabel("Spectrum", fontsize=8)
+            if i == 0:
+                top.set_ylabel("Component (a.u.)", fontsize=8)
+                bottom.set_ylabel("Contribution", fontsize=8)
+            if n <= 20:
+                bottom.set_xticks(numbers)
+                bottom.set_xticklabels(short, rotation=45, ha="right", fontsize=7)
+            for ax in (top, bottom):
+                ax.tick_params(labelsize=8)
+        self.figure.tight_layout()
+
+    def _draw_residuals(self):
+        r = self.result
+        n = len(r["labels"])
+        numbers = np.arange(1, n + 1)
+        short = self._short_labels()
+        axes = self.figure.subplots(2, 2)
+        ax = axes[0, 0]
+        for row, name in zip(r["residuals"], short):
+            ax.plot(r["wavenumber"], row, label=name, linewidth=1)
+        ax.set_title("Residual spectra (measured \u2212 fitted)", fontsize=9)
+        ax.set_xlabel("Wavenumber (cm\u207b\u00b9)", fontsize=8)
+        if n <= 8:
+            ax.legend(fontsize=6)
+        ax = axes[0, 1]
+        ax.plot(numbers, r["residual_norm"], marker="o")
+        ax.set_title("Residual norm per spectrum", fontsize=9)
+        ax.set_xlabel("Spectrum", fontsize=8)
+        if n <= 20:
+            ax.set_xticks(numbers)
+            ax.set_xticklabels(short, rotation=45, ha="right", fontsize=7)
+        ax = axes[1, 0]
+        limit = float(np.max(np.abs(r["residuals"]))) or 1.0
+        image = ax.imshow(
+            r["residuals"], aspect="auto", cmap="RdBu_r", vmin=-limit, vmax=limit,
+            extent=[r["wavenumber"][0], r["wavenumber"][-1], n + 0.5, 0.5],
+        )
+        self.figure.colorbar(image, ax=ax, label="Residual")
+        ax.set_title("Residual heat map", fontsize=9)
+        ax.set_xlabel("Wavenumber (cm\u207b\u00b9)", fontsize=8)
+        ax.set_ylabel("Spectrum", fontsize=8)
+        ax = axes[1, 1]
+        ax.plot(r["wavenumber"], r["residuals"].mean(axis=0))
+        ax.axhline(0.0, color="gray", linewidth=0.8)
+        ax.set_title("Mean residual (should be ~0)", fontsize=9)
+        ax.set_xlabel("Wavenumber (cm\u207b\u00b9)", fontsize=8)
+        for a in axes.ravel():
+            a.tick_params(labelsize=8)
+        self.figure.tight_layout()
+
+
 class View(ctk.CTk):
     """Main window: buttons, reference file fields, plot, switches and toolbar."""
 
@@ -575,6 +923,8 @@ class View(ctk.CTk):
         self.clear_button.pack(side="left", padx=(10, 0))
         self.svd_button = ctk.CTkButton(bar, text="SVD...")
         self.svd_button.pack(side="left", padx=(10, 0))
+        self.mcr_button = ctk.CTkButton(bar, text="MCR...")
+        self.mcr_button.pack(side="left", padx=(10, 0))
 
         # Row 1: empty cell, background and water vapour files
         cells = ctk.CTkFrame(self)

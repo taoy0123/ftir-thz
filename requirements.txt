@@ -20,5 +20,6 @@ Pygments==2.21.0
 pyparsing==3.3.3
 pytest==9.2.0
 python-dateutil==4.0.0
+scipy==1.18.1
 tomlkit==0.15.2
 tzdata==2026.6

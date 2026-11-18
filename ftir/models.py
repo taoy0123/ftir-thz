@@ -980,3 +980,303 @@ def remove_bulk_solvent(
     return (
         alpha_solution / total_concentration - solvent_mole_fraction * epsilon_solvent
     ) / (1.0 - solvent_mole_fraction)
+
+# ----------------------------------------------------------------------
+# Multivariate curve resolution (MCR-ALS)
+# ----------------------------------------------------------------------
+def load_known_spectra(filename):
+    """Read known (reference) spectra for MCR: a list of (label, wavenumbers, values).
+
+    Accepts a CSV (or semicolon/tab/space separated) file whose first column is
+    the wavenumber and whose other columns are spectra, optionally with a header
+    row, such as the files saved by "Save spectra". A two-column text file gives
+    one spectrum. Each spectrum is labelled with the file name (without its
+    extension), not the column header; a file with several spectra gets
+    "name (spectrum 1)", "name (spectrum 2)", ... Rows that are not numbers are
+    skipped, and the result is sorted by wavenumber.
+    """
+    import re
+    from pathlib import Path
+
+    rows, header = [], None
+    with open(filename, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p for p in re.split(r"[,;\t ]+", line) if p != ""]
+            try:
+                rows.append([float(p) for p in parts])
+            except ValueError:
+                if not rows and header is None:
+                    # header line: split on commas/semicolons/tabs only (names may hold spaces)
+                    header = [p.strip() for p in re.split(r"[,;\t]", line)]
+    if not rows:
+        raise ValueError(f"{Path(filename).name}: no numeric data found.")
+    width = min(len(r) for r in rows)
+    if width < 2:
+        raise ValueError(f"{Path(filename).name}: needs a wavenumber column and at least one spectrum.")
+    data = np.array([r[:width] for r in rows], dtype=float)
+    order = np.argsort(data[:, 0])
+    data = data[order]
+
+    spectra = []
+    for column in range(1, width):
+        # labelled with the file name (not the column header); a file holding several
+        # spectra numbers them so the labels stay distinct
+        label = Path(filename).stem + ("" if width == 2 else f" (spectrum {column})")
+        values = data[:, column]
+        good = np.isfinite(data[:, 0]) & np.isfinite(values)
+        spectra.append((label, data[good, 0], values[good]))
+    return spectra
+
+
+def _nonneg_lstsq(design, targets):
+    """Least squares with x >= 0, one column of `targets` at a time -> (n_unknowns, n_columns)."""
+    try:
+        from scipy.optimize import nnls
+    except ImportError:  # no SciPy: unconstrained solution clipped at zero
+        return np.clip(np.linalg.lstsq(design, targets, rcond=None)[0], 0.0, None)
+    out = np.zeros((design.shape[1], targets.shape[1]))
+    for j in range(targets.shape[1]):
+        out[:, j] = nnls(design, targets[:, j])[0]
+    return out
+
+
+def mcr_spectra(
+    spectra,
+    known=(),
+    n_unknown=1,
+    wavenumber_range=None,
+    nonneg_scores=False,
+    nonneg_spectra=False,
+    max_iter=300,
+    tol=1e-9,
+):
+    """Multivariate curve resolution (MCR-ALS) of a set of spectra.
+
+    Model: spectra = scores x components + residual, with the components of the
+    KNOWN spectra held fixed and `n_unknown` further components found from the
+    data.
+
+    Parameters
+    ----------
+    spectra : list of (label, wavenumbers, values)   (two or more)
+    known   : list of (label, wavenumbers, values)   spectra whose shape is given.
+        They are interpolated onto the shared axis and must cover the range used.
+        Their scores are in units of the known spectrum (a score of 1 means "as
+        much as in the known spectrum").
+    n_unknown : number of unknown components (0 = just fit the known spectra).
+    wavenumber_range : (low, high), either end may be None.
+    nonneg_scores : constrain every score >= 0 (non-negative least squares).
+    nonneg_spectra : constrain the unknown spectra >= 0. Leave off for spectra
+        that can go negative (e.g. absorption coefficients in which the solvent
+        has been displaced).
+
+    Method (a cleaner version of a typical pyMCR script):
+      1. Known scores come from least squares on the known spectra.
+      2. Unknown spectra start as the leading principal components of what
+         the known spectra do not explain (not a single sample, which depends on
+         which sample happens to be picked). They are orthogonal to the known
+         spectra, which makes the unconstrained solution unique: "the known
+         spectra first, the unknown ones describe the rest".
+      3. Alternating least squares: scores from the spectra, then unknown
+         spectra from the scores, with the known rows fixed, until the residual
+         stops changing.
+      4. Every unknown component is scaled so that its largest |score| is 1, and
+         its sign is chosen so that this score is positive.
+    With more than one unknown component the split between them is not unique
+    (rotation ambiguity) unless the non-negativity constraints are used.
+
+    Returns a dict: wavenumber (m,), components (K, m) known first, scores
+    (n, K), residuals (n, m), fitted (n, m), residual_norm (n,), lack_of_fit
+    (n,) in percent of each spectrum's norm, labels (n), component_labels (K),
+    is_known (K), n_iterations, converged, total_lack_of_fit (percent).
+    """
+    if len(spectra) < 2:
+        raise ValueError("MCR needs at least two spectra.")
+    n_known = len(known)
+    n_unknown = int(n_unknown)
+    n_comp = n_known + n_unknown
+    if n_comp < 1:
+        raise ValueError("Add at least one known spectrum or one unknown component.")
+    if n_unknown < 0:
+        raise ValueError("The number of unknown components cannot be negative.")
+    if n_comp > len(spectra):
+        raise ValueError(
+            f"{n_comp} components need at least {n_comp} spectra, but only {len(spectra)} are displayed."
+        )
+
+    shared = resample_to_common_axis(spectra)
+    axis = shared[0][1]
+    labels = [label for label, _, _ in shared]
+    X = np.vstack([values for _, _, values in shared])
+
+    keep = np.ones(axis.size, dtype=bool)
+    if wavenumber_range is not None:
+        low, high = wavenumber_range
+        if low is not None:
+            keep &= axis >= low
+        if high is not None:
+            keep &= axis <= high
+    keep &= np.all(np.isfinite(X), axis=0)
+
+    known_rows, known_labels = [], []
+    for label, kf, kv in known:
+        kf = np.asarray(kf, dtype=float)
+        kv = np.asarray(kv, dtype=float)
+        order = np.argsort(kf)
+        kf, kv = kf[order], kv[order]
+        if kf.size < 2:
+            raise ValueError(f"Known spectrum '{label}' has too few points.")
+        step = float(np.median(np.diff(axis))) if axis.size > 1 else 1.0
+        covered = (axis >= kf[0] - step) & (axis <= kf[-1] + step)
+        wanted = keep & ~covered
+        if wanted.any():
+            raise ValueError(
+                f"Known spectrum '{label}' covers only {kf[0]:.1f}-{kf[-1]:.1f} cm\u207b\u00b9, "
+                f"but the range used is {axis[keep][0]:.1f}-{axis[keep][-1]:.1f} cm\u207b\u00b9. "
+                "Narrow the wavenumber range."
+            )
+        interp = np.interp(axis, kf, kv)
+        keep &= np.isfinite(interp)
+        known_rows.append(interp)
+        known_labels.append(label)
+
+    if keep.sum() < n_comp + 1:
+        raise ValueError(
+            f"Only {int(keep.sum())} usable wavenumber points for {n_comp} components; "
+            "widen the range or check that the known spectra cover it."
+        )
+    axis, X = axis[keep], X[:, keep]
+    ST_known = np.vstack([row[keep] for row in known_rows]) if n_known else np.empty((0, axis.size))
+    if np.linalg.norm(X) == 0.0:
+        raise ValueError("The spectra are all zero in this range.")
+
+    def solve_scores(ST):
+        if nonneg_scores:
+            return _nonneg_lstsq(ST.T, X.T).T
+        return np.linalg.lstsq(ST.T, X.T, rcond=None)[0].T
+
+    # --- initial unknown spectra: principal components of what the known ones leave unexplained
+    if n_known:
+        C0 = np.linalg.lstsq(ST_known.T, X.T, rcond=None)[0].T
+        leftover = X - C0 @ ST_known
+    else:
+        leftover = X
+    ST_unknown = np.empty((0, axis.size))
+    if n_unknown:
+        u, s, vh = np.linalg.svd(leftover, full_matrices=False)
+        if s.size < n_unknown or s[n_unknown - 1] <= 1e-12 * max(s[0], 1e-300):
+            raise ValueError(
+                "The known spectra already explain the data; there is nothing left for "
+                f"{n_unknown} unknown component(s). Use fewer unknown components."
+            )
+        # sign: make the typical score positive, so a non-negativity constraint on the
+        # scores does not start from the wrong sign and collapse to zero
+        signs = np.where(u[:, :n_unknown].sum(axis=0) >= 0, 1.0, -1.0)
+        ST_unknown = signs[:, None] * s[:n_unknown, None] * vh[:n_unknown]
+        if nonneg_spectra:
+            ST_unknown = np.clip(ST_unknown, 0.0, None)
+    ST = np.vstack([ST_known, ST_unknown])
+
+    # --- alternating least squares
+    previous = np.inf
+    converged = False
+    iterations = 0
+    C = solve_scores(ST)
+    for iterations in range(1, int(max_iter) + 1):
+        C = solve_scores(ST)
+        if n_unknown:
+            target = X - C[:, :n_known] @ ST_known
+            C_unknown = C[:, n_known:]
+            if nonneg_spectra:
+                updated = _nonneg_lstsq(C_unknown, target)
+            else:
+                updated = np.linalg.lstsq(C_unknown, target, rcond=None)[0]
+            # a component whose scores all went to zero cannot be updated: keep its last spectrum
+            dead = ~np.any(C_unknown != 0.0, axis=0)
+            updated[dead] = ST_unknown[dead]
+            ST_unknown = updated
+            ST = np.vstack([ST_known, ST_unknown])
+        error = float(np.linalg.norm(X - C @ ST))
+        if abs(previous - error) <= tol * max(error, 1e-300):
+            converged = True
+            break
+        previous = error
+    C = solve_scores(ST)
+
+    # --- scale and sign of the unknown components
+    for i in range(n_known, n_comp):
+        peak = int(np.argmax(np.abs(C[:, i])))
+        scale = abs(C[peak, i])
+        if scale == 0.0:
+            continue
+        sign = 1.0 if C[peak, i] > 0 else -1.0
+        C[:, i] /= sign * scale
+        ST[i] *= sign * scale
+
+    fitted = C @ ST
+    R = X - fitted
+    norms = np.linalg.norm(X, axis=1)
+    rnorm = np.linalg.norm(R, axis=1)
+    component_labels = [f"Known: {name}" for name in known_labels] + [
+        f"Unknown {i + 1}" for i in range(n_unknown)
+    ]
+    return {
+        "wavenumber": axis,
+        "components": ST,
+        "scores": C,
+        "residuals": R,
+        "fitted": fitted,
+        "residual_norm": rnorm,
+        "lack_of_fit": 100.0 * rnorm / np.where(norms == 0, 1.0, norms),
+        "total_lack_of_fit": 100.0 * float(np.linalg.norm(R) / np.linalg.norm(X)),
+        "labels": labels,
+        "component_labels": component_labels,
+        "is_known": [True] * n_known + [False] * n_unknown,
+        "n_iterations": iterations,
+        "converged": converged,
+        "nonneg_scores": bool(nonneg_scores),
+        "nonneg_spectra": bool(nonneg_spectra),
+    }
+
+
+def save_mcr(path, result):
+    """Save MCR results as four CSV files next to `path` ("name.csv" gives):
+        name_components.csv  wavenumber, one column per component spectrum
+        name_scores.csv      spectrum, one column per component (contribution)
+        name_residuals.csv   wavenumber, one column per spectrum (measured - fitted)
+        name_fit.csv         spectrum, residual_norm, lack_of_fit_percent
+    Returns the four file names.
+    """
+    from pathlib import Path
+
+    stem = Path(path).with_suffix("")
+
+    def quote(text):
+        return '"' + str(text).replace('"', '""') + '"'
+
+    comp_path = Path(f"{stem}_components.csv")
+    scores_path = Path(f"{stem}_scores.csv")
+    resid_path = Path(f"{stem}_residuals.csv")
+    fit_path = Path(f"{stem}_fit.csv")
+    names = [quote(n) for n in result["component_labels"]]
+
+    with open(comp_path, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(["wavenumber"] + names) + "\n")
+        for row in np.column_stack([result["wavenumber"], result["components"].T]):
+            f.write(",".join(f"{v:.10g}" for v in row) + "\n")
+    with open(scores_path, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(["spectrum"] + names) + "\n")
+        for label, row in zip(result["labels"], result["scores"]):
+            f.write(",".join([quote(label)] + [f"{v:.10g}" for v in row]) + "\n")
+    with open(resid_path, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(["wavenumber"] + [quote(l) for l in result["labels"]]) + "\n")
+        for row in np.column_stack([result["wavenumber"], result["residuals"].T]):
+            f.write(",".join(f"{v:.10g}" for v in row) + "\n")
+    with open(fit_path, "w", encoding="utf-8", newline="") as f:
+        f.write("spectrum,residual_norm,lack_of_fit_percent\n")
+        for label, rn, lof in zip(result["labels"], result["residual_norm"], result["lack_of_fit"]):
+            f.write(f"{quote(label)},{rn:.10g},{lof:.10g}\n")
+    return str(comp_path), str(scores_path), str(resid_path), str(fit_path)
